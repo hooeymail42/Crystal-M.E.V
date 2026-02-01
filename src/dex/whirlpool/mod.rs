@@ -4,8 +4,8 @@ pub mod utils;
 
 use crate::dex::whirlpool::state::{Whirlpool, TICK_ARRAY_SIZE};
 use crate::dex::whirlpool::constants::{MAX_TICK_INDEX, MIN_TICK_INDEX};
-use solana_program::instruction::AccountMeta;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::instruction::AccountMeta;
+use solana_sdk::pubkey::Pubkey;
 
 pub type TickArrayStartIndexes = (i32, Option<i32>, Option<i32>);
 

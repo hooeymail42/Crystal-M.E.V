@@ -1,151 +1,302 @@
-use solana_mev_bot::{
-    chain::{
-        token_fetch::{TokenFetchConfig, TokenFetcher},
-        token_price::{MarketDataFetcher, PriceMonitor},
-    },
-    config::Config,
-};
+mod chain;
+mod config;
+mod dex;
+
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, signer::Signer};
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Keypair;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use std::str::FromStr;
+use anyhow::Result;
+use tracing::{info, warn};
+
+use crate::config::BotConfig;
+use crate::chain::pools::{MintPoolData, PoolData};
+use crate::chain::opportunity_detector::{OpportunityDetector, OpportunityConfig};
+use crate::chain::refresh::PoolRefreshManager;
+use crate::chain::transaction::TransactionBuilder;
+use crate::chain::wallet_integration::WalletConfig;
+use crate::chain::constants::SOL_MINT;
 
 #[tokio::main]
-async fn main() {
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_line_number(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("solana_mev_bot=info".parse().unwrap())
+        )
+        .init();
 
-    // Load configuration from environment variables
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Failed to load configuration: {}", e);
-            return;
+    info!("Solana MEV Arbitrage Bot starting...");
+
+    // Load config
+    let config = BotConfig::from_env()?;
+    info!("Config loaded: RPC={}, mints={}, real_execution={}",
+        config.rpc_url, config.mints.len(), config.enable_real_execution);
+
+    let rpc = Arc::new(RpcClient::new(config.rpc_url.clone()));
+
+    // Load wallet
+    let wallet = if config.wallet_private_key.is_empty() {
+        info!("No wallet key configured, using test wallet (demo mode)");
+        WalletConfig::test_wallet()
+    } else {
+        WalletConfig::from_env().unwrap_or_else(|e| {
+            warn!("Failed to load wallet from env: {}, using test wallet", e);
+            WalletConfig::test_wallet()
+        })
+    };
+    info!("Wallet: {}", wallet.address());
+
+    match rpc.get_balance(&wallet.address()) {
+        Ok(balance) => info!("Wallet balance: {:.4} SOL", balance as f64 / 1e9),
+        Err(e) => warn!("Could not fetch balance: {}", e),
+    }
+
+    let payer = Arc::new(Keypair::new());
+
+    let tx_builder = TransactionBuilder::new(
+        rpc.clone(),
+        payer,
+        config.compute_unit_limit,
+        config.priority_fee_lamports,
+        config.spam_rpc_urls.clone(),
+        config.enable_real_execution,
+    );
+
+    let mut refresh_manager = PoolRefreshManager::new(rpc.clone());
+
+    // Load MintPoolData from config
+    let mut mint_pool_datas: Vec<MintPoolData> = Vec::new();
+
+    for mint_config in &config.mints {
+        let mut mpd = MintPoolData::new(
+            &mint_config.mint.to_string(),
+            &wallet.address().to_string(),
+            spl_token::id(),
+        )?;
+
+        for pool_addr in &mint_config.raydium_pools {
+            if let Err(e) = mpd.add_raydium_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Raydium pool {}: {}", pool_addr, e);
+            }
         }
+
+        for pool_addr in &mint_config.pump_pools {
+            if let Err(e) = mpd.add_pump_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Pump pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.dlmm_pools {
+            if let Err(e) = mpd.add_dlmm_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                vec![],
+                None,
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add DLMM pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.whirlpool_pools {
+            if let Err(e) = mpd.add_whirlpool_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                vec![],
+                None,
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Whirlpool pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.meteora_damm_v2_pools {
+            if let Err(e) = mpd.add_meteora_damm_v2_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add DAMM V2 pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.solfi_pools {
+            if let Err(e) = mpd.add_solfi_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add SolFi pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.vertigo_pools {
+            if let Err(e) = mpd.add_vertigo_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Vertigo pool {}: {}", pool_addr, e);
+            }
+        }
+
+        info!("Loaded {} pools for mint {}", mpd.pools.len(), mint_config.mint);
+        mint_pool_datas.push(mpd);
+    }
+
+    let opp_config = OpportunityConfig {
+        min_profit_percent: config.min_profit_sol * 100.0,
+        min_liquidity_sol: 1.0,
+        max_slippage_percent: config.max_slippage_pct,
+        max_volatility_percent: 10.0,
     };
 
-    println!("Configuration loaded successfully!");
-    println!("RPC URL: {}", config.rpc.url);
-    println!("Compute unit limit: {}", config.bot.compute_unit_limit);
+    let slippage_bps = (config.max_slippage_pct * 100.0) as u64; // convert % to bps
+    let user_token_accounts: HashMap<String, Pubkey> = HashMap::new();
 
-    // Parse wallet private key and derive wallet address
-    let wallet_keypair = Keypair::from_base58_string(&config.wallet.private_key);
-    
-    let wallet_address = wallet_keypair.pubkey().to_string();
-    println!("Wallet address: {}", wallet_address);
+    info!("Starting main trading loop (interval={}ms)", config.loop_interval_ms);
 
-    // Initialize RPC client
-    let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+    if !config.enable_real_execution {
+        info!("[DEMO MODE] Set ENABLE_REAL_EXECUTION=true to go live");
+    }
 
-    // Initialize enhanced token fetcher
-    let token_fetch_config = TokenFetchConfig {
-        max_retries: 3,
-        retry_delay_ms: 1000,
-        batch_size: 10,
-        timeout_seconds: 30,
-        enable_caching: true,
-        cache_ttl_seconds: 300,
-    };
+    let mut interval = tokio::time::interval(
+        tokio::time::Duration::from_millis(config.loop_interval_ms)
+    );
+    let mut loop_count: u64 = 0;
+    let mut total_opportunities: u64 = 0;
+    let mut total_executions: u64 = 0;
 
-    let mut token_fetcher = TokenFetcher::new(rpc_client.clone(), token_fetch_config);
+    loop {
+        interval.tick().await;
+        loop_count += 1;
 
-    // Initialize market data fetcher
-    let mut market_fetcher = MarketDataFetcher::new(rpc_client.clone());
-
-    // Initialize price monitor
-    let mut price_monitor = PriceMonitor::new(rpc_client, 5000, 0.5); // 5 second intervals, 0.5% threshold
-
-    // Process each mint configuration
-    for mint_config in &config.routing.mint_config_list {
-        println!("\nProcessing mint: {}", mint_config.mint);
-
-        // Fetch pool data using enhanced token fetcher
-        match token_fetcher
-            .initialize_pool_data(
-                &mint_config.mint,
-                &wallet_address, // Use derived wallet address
-                mint_config.raydium_pool_list.as_ref(),
-                mint_config.raydium_cp_pool_list.as_ref(),
-                mint_config.pump_pool_list.as_ref(),
-                mint_config.meteora_dlmm_pool_list.as_ref(),
-                mint_config.whirlpool_pool_list.as_ref(),
-                mint_config.raydium_clmm_pool_list.as_ref(),
-                mint_config.meteora_damm_pool_list.as_ref(),
-                mint_config.solfi_pool_list.as_ref(),
-                mint_config.meteora_damm_v2_pool_list.as_ref(),
-                mint_config.vertigo_pool_list.as_ref(),
-            )
-            .await
-        {
-            Ok(pool_data) => {
-                println!("Successfully loaded pool data for mint: {}", mint_config.mint);
-                println!("  - Raydium pools: {}", pool_data.raydium_pools.len());
-                println!("  - Pump pools: {}", pool_data.pump_pools.len());
-                println!("  - Whirlpool pools: {}", pool_data.whirlpool_pools.len());
-
-                // Fetch token price
-                match market_fetcher.fetch_token_price(&mint_config.mint).await {
-                    Ok(price) => {
-                        println!(
-                            "Token price: ${:.6} USD, {:.6} SOL (source: {})",
-                            price.price_usd, price.price_sol, price.source
-                        );
-                    }
-                    Err(e) => {
-                        println!("Failed to fetch token price: {}", e);
+        // Full refresh: deserialize pool accounts + fetch vault balances
+        for mpd in &mint_pool_datas {
+            match refresh_manager.refresh_all(mpd) {
+                Ok(count) => {
+                    if loop_count % 20 == 0 && count > 0 {
+                        info!("[Loop {}] Refreshed {} pools for mint {}", loop_count, count, mpd.mint);
                     }
                 }
+                Err(e) => {
+                    if loop_count % 100 == 0 {
+                        warn!("Refresh error for mint {}: {}", mpd.mint, e);
+                    }
+                }
+            }
+        }
 
-                // Calculate arbitrage opportunities
-                match market_fetcher
-                    .calculate_arbitrage_opportunities(&pool_data)
-                    .await
-                {
-                    Ok(opportunities) => {
-                        if opportunities.is_empty() {
-                            println!("No significant arbitrage opportunities found");
-                        } else {
-                            println!("Found {} arbitrage opportunities:", opportunities.len());
-                            for (i, opp) in opportunities.iter().enumerate() {
-                                println!(
-                                    "  {}. {}: Buy on {} at {:.6}, Sell on {} at {:.6} ({}% profit)",
-                                    i + 1,
-                                    opp.token_mint,
-                                    opp.best_buy_dex,
-                                    opp.best_buy_price,
-                                    opp.best_sell_dex,
-                                    opp.best_sell_price,
-                                    opp.potential_profit_percent
-                                );
+        // Detect opportunities
+        for mpd in &mint_pool_datas {
+            let mut detector = OpportunityDetector::new(opp_config.clone(), &rpc);
+            let opportunities = detector.find_opportunities(mpd);
+
+            if !opportunities.is_empty() {
+                total_opportunities += opportunities.len() as u64;
+                info!("[Loop {}] Found {} opportunities for mint {}",
+                    loop_count, opportunities.len(), mpd.mint);
+
+                for (i, opp) in opportunities.iter().enumerate().take(3) {
+                    info!(
+                        "  #{}: {} -> {} | profit={:.6} SOL ({:.2}%) | confidence={}",
+                        i + 1,
+                        opp.path.first().map(|p| p.dex.as_str()).unwrap_or("?"),
+                        opp.path.last().map(|p| p.dex.as_str()).unwrap_or("?"),
+                        opp.gross_profit_sol,
+                        opp.profit_percent,
+                        opp.confidence_score,
+                    );
+                }
+
+                // Execute best opportunity
+                if let Some(best) = opportunities.first() {
+                    let est_gas_cost = config.priority_fee_lamports as f64 / 1e9;
+                    let net_profit = best.gross_profit_sol - est_gas_cost;
+
+                    if net_profit > config.min_profit_sol {
+                        info!("Profitable after gas: net={:.6} SOL, building TX...", net_profit);
+
+                        // Build swap instructions from opportunity path
+                        match tx_builder.build_instructions_from_opportunity(
+                            best,
+                            &refresh_manager,
+                            &user_token_accounts,
+                            slippage_bps,
+                        ) {
+                            Ok(swap_ixs) => {
+                                info!("Built {} swap instructions", swap_ixs.len());
+
+                                match tx_builder.get_recent_blockhash() {
+                                    Ok(blockhash) => {
+                                        match tx_builder.build_swap_transaction(swap_ixs, blockhash) {
+                                            Ok(tx) => {
+                                                match tx_builder.simulate(&tx) {
+                                                    Ok(true) => {
+                                                        info!("Simulation passed, executing...");
+                                                        match tx_builder.send_and_confirm(&tx) {
+                                                            Ok(sig) => {
+                                                                total_executions += 1;
+                                                                info!("TX confirmed: {} (total executions: {})", sig, total_executions);
+                                                            }
+                                                            Err(e) => warn!("TX send failed: {}", e),
+                                                        }
+                                                    }
+                                                    Ok(false) => warn!("Simulation failed, skipping"),
+                                                    Err(e) => warn!("Simulation error: {}", e),
+                                                }
+                                            }
+                                            Err(e) => warn!("Failed to build tx: {}", e),
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to get blockhash: {}", e),
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to build swap IXs: {}", e);
                             }
                         }
                     }
-                    Err(e) => {
-                        println!("Failed to calculate arbitrage opportunities: {}", e);
-                    }
                 }
             }
-            Err(e) => {
-                println!("Failed to load pool data for mint {}: {}", mint_config.mint, e);
-            }
+        }
+
+        if loop_count % 100 == 0 {
+            info!(
+                "[Status] Loop={}, Opportunities={}, Executions={}, Mints={}",
+                loop_count, total_opportunities, total_executions, mint_pool_datas.len()
+            );
         }
     }
-
-    // Start price monitoring (this would run indefinitely in a real bot)
-    println!("\nStarting price monitoring...");
-    let mints: Vec<String> = config
-        .routing
-        .mint_config_list
-        .iter()
-        .map(|mc| mc.mint.clone())
-        .collect();
-
-    // Uncomment the following line to start continuous price monitoring
-    // price_monitor.start_monitoring(mints).await;
-
-    println!("Enhanced token fetch logic demonstration completed!");
-    println!("The bot is now ready for production use with improved error handling, caching, and retry logic.");
 }

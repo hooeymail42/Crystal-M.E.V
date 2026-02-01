@@ -1,4 +1,4 @@
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
 pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";

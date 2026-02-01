@@ -1,451 +1,856 @@
-use crate::{
-    config::Config,
-    dex::{
-        raydium::{raydium_authority, raydium_cp_authority},
-        solfi::constants::solfi_program_id,
-        vertigo::constants::vertigo_program_id,
-    },
-    chain::pools::MintPoolData,
-};
+use anyhow::{Result, anyhow};
 use solana_client::rpc_client::RpcClient;
-use solana_program::instruction::Instruction;
-use solana_sdk::address_lookup_table::AddressLookupTableAccount;
-use solana_sdk::commitment_config::CommitmentLevel;
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::AccountMeta;
-use solana_sdk::message::v0::Message;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signature};
-use solana_sdk::signer::Signer;
-use solana_sdk::system_program;
-use solana_sdk::transaction::VersionedTransaction;
-use std::sync::Arc;
-use tracing::{debug, error, info};
-
-use super::constants::sol_mint;
-use crate::dex::{
-    meteora::constants::{
-        damm_program_id, damm_v2_event_authority, damm_v2_pool_authority, damm_v2_program_id,
-        dlmm_event_authority, dlmm_program_id, vault_program_id,
-    },
-    pump::constants::{pump_fee_wallet, pump_program_id},
-    raydium::constants::{raydium_clmm_program_id, raydium_cp_program_id, raydium_program_id},
-    whirlpool::constants::whirlpool_program_id,
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    transaction::Transaction,
 };
-use spl_associated_token_account::ID as associated_token_program_id;
-use spl_token::ID as token_program_id;
+use spl_associated_token_account::get_associated_token_address;
+use std::sync::Arc;
 use std::str::FromStr;
+use tracing::{info, warn};
 
-pub async fn build_and_send_transaction(
-    wallet_kp: &Keypair,
-    config: &Config,
-    mint_pool_data: &MintPoolData,
-    rpc_clients: &[Arc<RpcClient>],
-    blockhash: Hash,
-    address_lookup_table_accounts: &[AddressLookupTableAccount],
-) -> anyhow::Result<Vec<Signature>> {
-    let enable_flashloan = config.flashloan.as_ref().map_or(false, |k| k.enabled);
-    let compute_unit_limit = config.bot.compute_unit_limit;
-    let mut instructions = vec![];
-    // Add a random number here to make each transaction unique
-    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(
-        compute_unit_limit + rand::random::<u32>() % 1000,
-    );
-    instructions.push(compute_budget_ix);
+use crate::chain::opportunity_detector::{ArbitrageOpportunity, PathStep};
+use crate::chain::refresh::{DeserializedPoolState, PoolRefreshManager};
+use crate::dex::raydium::constants::{raydium_amm_program_id, raydium_cp_amm_program_id, raydium_clmm_program_id};
+use crate::dex::pump::constants::pump_program_id;
+use crate::dex::meteora::constants::{meteora_dlmm_program_id, meteora_damm_v2_program_id};
+use crate::dex::whirlpool::constants::whirlpool_program_id;
 
-    let compute_unit_price = config.spam.as_ref().map_or(1000, |s| s.compute_unit_price);
-    let compute_budget_price_ix =
-        ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
-    instructions.push(compute_budget_price_ix);
+/// Builds and submits versioned transactions with compute budget
+pub struct TransactionBuilder {
+    rpc: Arc<RpcClient>,
+    payer: Arc<Keypair>,
+    compute_unit_limit: u32,
+    priority_fee_lamports: u64,
+    spam_rpc_urls: Vec<String>,
+    real_execution: bool,
+}
 
-    let swap_ix = create_swap_instruction(
-        wallet_kp,
-        mint_pool_data,
-        compute_unit_limit,
-        enable_flashloan,
-    )?;
+impl TransactionBuilder {
+    pub fn new(
+        rpc: Arc<RpcClient>,
+        payer: Arc<Keypair>,
+        compute_unit_limit: u32,
+        priority_fee_lamports: u64,
+        spam_rpc_urls: Vec<String>,
+        real_execution: bool,
+    ) -> Self {
+        Self {
+            rpc,
+            payer,
+            compute_unit_limit,
+            priority_fee_lamports,
+            spam_rpc_urls,
+            real_execution,
+        }
+    }
 
-    let mut all_instructions = instructions.clone();
+    /// Derive user's Associated Token Account for a given mint
+    fn get_user_ata(&self, mint: &Pubkey) -> Pubkey {
+        get_associated_token_address(&self.payer.pubkey(), mint)
+    }
 
-    debug!("Adding swap instruction");
-    all_instructions.push(swap_ix);
+    /// Derive Raydium AMM authority PDA
+    fn raydium_amm_authority() -> Pubkey {
+        // Raydium AMM V4 authority: seeds = [b"amm authority"]
+        // The canonical authority uses nonce iteration; the well-known address is:
+        Pubkey::find_program_address(
+            &[b"amm authority"],
+            &raydium_amm_program_id(),
+        ).0
+    }
 
-    let message = Message::try_compile(
-        &wallet_kp.pubkey(),
-        &all_instructions,
-        address_lookup_table_accounts,
-        blockhash,
-    )?;
+    /// Build a transaction with compute budget instructions prepended
+    pub fn build_swap_transaction(
+        &self,
+        swap_instructions: Vec<Instruction>,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction> {
+        let mut instructions = Vec::with_capacity(swap_instructions.len() + 2);
 
-    let tx = VersionedTransaction::try_new(
-        solana_sdk::message::VersionedMessage::V0(message),
-        &[wallet_kp],
-    )?;
+        instructions.push(
+            ComputeBudgetInstruction::set_compute_unit_limit(self.compute_unit_limit)
+        );
 
-    let max_retries = config
-        .spam
-        .as_ref()
-        .and_then(|s| s.max_retries)
-        .unwrap_or(3);
+        if self.priority_fee_lamports > 0 {
+            let microlamports_per_cu = (self.priority_fee_lamports * 1_000_000) / self.compute_unit_limit as u64;
+            instructions.push(
+                ComputeBudgetInstruction::set_compute_unit_price(microlamports_per_cu)
+            );
+        }
 
-    let mut signatures = Vec::new();
+        instructions.extend(swap_instructions);
 
-    for (i, client) in rpc_clients.iter().enumerate() {
-        debug!("Sending transaction through RPC client {}", i);
+        let message = Message::new(&instructions, Some(&self.payer.pubkey()));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.sign(&[self.payer.as_ref()], recent_blockhash);
 
-        let signature = match send_transaction_with_retries(client, &tx, max_retries).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                error!("Failed to send transaction through RPC client {}: {}", i, e);
-                continue;
+        Ok(tx)
+    }
+
+    /// Simulate a transaction without sending it
+    pub fn simulate(&self, tx: &Transaction) -> Result<bool> {
+        let result = self.rpc.simulate_transaction(tx)?;
+
+        if let Some(err) = result.value.err {
+            warn!("Simulation failed: {:?}", err);
+            Ok(false)
+        } else {
+            let units_consumed = result.value.units_consumed.unwrap_or(0);
+            info!("Simulation passed, CU used: {}", units_consumed);
+            Ok(true)
+        }
+    }
+
+    /// Send transaction and wait for confirmation
+    pub fn send_and_confirm(&self, tx: &Transaction) -> Result<String> {
+        if !self.real_execution {
+            info!("[DEMO] Would send transaction with {} instructions", tx.message.instructions.len());
+            return Ok(format!("demo_sig_{}", self.payer.pubkey()));
+        }
+
+        let sig = self.rpc.send_and_confirm_transaction(tx)?;
+        info!("Transaction confirmed: {}", sig);
+        Ok(sig.to_string())
+    }
+
+    /// Submit transaction across multiple RPC endpoints in parallel
+    pub async fn parallel_submit(&self, tx: &Transaction) -> Result<String> {
+        if !self.real_execution {
+            info!("[DEMO] Would parallel submit across {} RPC endpoints", self.spam_rpc_urls.len() + 1);
+            return Ok(format!("demo_sig_{}", self.payer.pubkey()));
+        }
+
+        let primary_sig = self.rpc.send_and_confirm_transaction(tx)?;
+        let sig_str = primary_sig.to_string();
+
+        for url in &self.spam_rpc_urls {
+            let rpc = RpcClient::new(url.clone());
+            let tx_clone = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = rpc.send_transaction(&tx_clone);
+            });
+        }
+
+        info!("Parallel submit completed, primary sig: {}", sig_str);
+        Ok(sig_str)
+    }
+
+    /// Get a fresh blockhash
+    pub fn get_recent_blockhash(&self) -> Result<Hash> {
+        let hash = self.rpc.get_latest_blockhash()?;
+        Ok(hash)
+    }
+
+    /// Build swap instructions from an ArbitrageOpportunity path.
+    /// Uses the refresh manager's deserialized pool states to get actual vault addresses.
+    pub fn build_instructions_from_opportunity(
+        &self,
+        opportunity: &ArbitrageOpportunity,
+        refresh_manager: &PoolRefreshManager,
+        user_token_accounts: &std::collections::HashMap<String, Pubkey>,
+        slippage_bps: u64,
+    ) -> Result<Vec<Instruction>> {
+        let mut instructions = Vec::new();
+
+        for step in &opportunity.path {
+            let pool_address = Pubkey::from_str(&step.pool_address)
+                .map_err(|e| anyhow!("Invalid pool address {}: {}", step.pool_address, e))?;
+
+            let amount_in = step.amount_in as u64;
+            let min_amount_out = ((step.amount_out as f64) * (10000.0 - slippage_bps as f64) / 10000.0) as u64;
+
+            let ix = match step.dex.as_str() {
+                "Raydium" => {
+                    self.build_raydium_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "Pump" => {
+                    self.build_pump_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "DLMM" => {
+                    self.build_dlmm_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "MeteoraDAmmV2" => {
+                    self.build_damm_v2_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "Whirlpool" => {
+                    self.build_whirlpool_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "RaydiumClmm" => {
+                    self.build_raydium_clmm_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                other => {
+                    warn!("Unsupported DEX for IX building: {}", other);
+                    continue;
+                }
+            };
+
+            instructions.push(ix);
+        }
+
+        if instructions.is_empty() {
+            return Err(anyhow!("No swap instructions could be built from opportunity"));
+        }
+
+        Ok(instructions)
+    }
+
+    fn build_raydium_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = raydium_amm_program_id();
+
+        let (coin_vault, pc_vault, coin_mint, pc_mint,
+             amm_open_orders, amm_target_orders,
+             serum_market, serum_program_id) = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::RaydiumAmm {
+                coin_vault, pc_vault, coin_mint, pc_mint,
+                amm_open_orders, amm_target_orders,
+                serum_market, serum_program_id, ..
+            }) => {
+                (*coin_vault, *pc_vault, *coin_mint, *pc_mint,
+                 *amm_open_orders, *amm_target_orders,
+                 *serum_market, *serum_program_id)
+            }
+            _ => {
+                return Err(anyhow!("No deserialized state for Raydium pool {}", pool_address));
             }
         };
 
-        info!(
-            "Transaction sent successfully through RPC client {}: {}",
-            i, signature
-        );
-        signatures.push(signature);
-    }
-
-    Ok(signatures)
-}
-
-async fn send_transaction_with_retries(
-    client: &RpcClient,
-    tx: &VersionedTransaction,
-    max_retries: u64,
-) -> anyhow::Result<Signature> {
-    Ok(client.send_transaction_with_config(
-        tx,
-        solana_client::rpc_config::RpcSendTransactionConfig {
-            skip_preflight: true,
-            max_retries: Some(max_retries as usize),
-            preflight_commitment: Some(CommitmentLevel::Confirmed),
-            ..Default::default()
-        },
-    )?)
-}
-
-/// Helper function to derive the vault token account PDA address for a given mint
-pub fn derive_vault_token_account(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"vault_token_account", mint.as_ref()], program_id)
-}
-
-fn create_swap_instruction(
-    wallet_kp: &Keypair,
-    mint_pool_data: &MintPoolData,
-    compute_unit_limit: u32,
-    use_flashloan: bool,
-) -> anyhow::Result<Instruction> {
-    debug!("Creating swap instruction for all DEX types");
-
-    let executor_program_id =
-        Pubkey::from_str("MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz").unwrap();
-
-    let fee_collector = if use_flashloan {
-        Pubkey::from_str("6AGB9kqgSp2mQXwYpdrV4QVV8urvCaDS35U1wsLssy6H").unwrap()
-    } else {
-        let fee_accounts = [
-            Pubkey::from_str("GPpkDpzCDmYJY5qNhYmM14c7rct1zmkjWc2CjR5g7RZ1").unwrap(),
-            Pubkey::from_str("J6c7noBHvWju4mMA3wXt3igbBSp2m9ATbA6cjMtAUged").unwrap(),
-            Pubkey::from_str("BjsfwxDu7GX7RRW6oSRTpMkASdXAgCcHnXEcatqSfuuY").unwrap(),
-        ];
-        fee_accounts[rand::random::<usize>() % fee_accounts.len()]
-    };
-
-    let pump_global_config =
-        Pubkey::from_str("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw").unwrap();
-    let pump_authority = Pubkey::from_str("GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR").unwrap();
-    let sysvar_instructions =
-        Pubkey::from_str("Sysvar1nstructions1111111111111111111111111").unwrap();
-    let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap();
-
-    let wallet = wallet_kp.pubkey();
-    let sol_mint_pubkey = sol_mint();
-    let wallet_sol_account = mint_pool_data.wallet_wsol_account;
-    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-
-    let mut accounts = vec![
-        AccountMeta::new(wallet, true), // 0. Wallet (signer)
-        AccountMeta::new_readonly(sol_mint_pubkey, false), // 1. SOL mint
-        AccountMeta::new(fee_collector, false), // 2. Fee collector
-        AccountMeta::new(wallet_sol_account, false), // 3. Wallet SOL account
-        AccountMeta::new_readonly(token_program_id, false), // 4. Token program
-        AccountMeta::new_readonly(system_program::ID, false), // 5. System program
-        AccountMeta::new_readonly(associated_token_program_id, false), // 6. Associated Token program
-    ];
-
-    // Determine the base mint for flashloan if needed
-    let flashloan_base_mint = if use_flashloan {
-        // For flashloan, we need a common base mint across all pools
-        // Check if all pools use SOL as base mint
-        let mut all_sol_base = true;
-        let mut all_usdc_base = true;
-
-        // Check all pool types to see their base mints
-        for pool in &mint_pool_data.raydium_pools {
-            if pool.base_mint != sol_mint_pubkey {
-                all_sol_base = false;
-            }
-            if pool.base_mint != usdc_mint {
-                all_usdc_base = false;
-            }
-        }
-        for pool in &mint_pool_data.raydium_cp_pools {
-            if pool.base_mint != sol_mint_pubkey {
-                all_sol_base = false;
-            }
-            if pool.base_mint != usdc_mint {
-                all_usdc_base = false;
-            }
-        }
-        // Add other pool type checks as needed...
-
-        if all_sol_base {
-            sol_mint_pubkey
-        } else if all_usdc_base {
-            usdc_mint
+        // Derive user ATAs based on swap direction
+        let (user_source, user_dest) = if step.action == "buy" {
+            // buying tokens with SOL: source=WSOL ATA, dest=token ATA
+            let sol_mint = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
+            (self.get_user_ata(&sol_mint), self.get_user_ata(&coin_mint))
         } else {
-            // Mixed base mints - default to SOL for now
-            sol_mint_pubkey
-        }
-    } else {
-        sol_mint_pubkey
-    };
+            // selling tokens for SOL
+            let sol_mint = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
+            (self.get_user_ata(&coin_mint), self.get_user_ata(&sol_mint))
+        };
 
-    if use_flashloan {
-        accounts.push(AccountMeta::new_readonly(
-            Pubkey::from_str("5LFpzqgsxrSfhKwbaFiAEJ2kbc9QyimjKueswsyU4T3o").unwrap(),
-            false,
-        ));
-        let token_pda = derive_vault_token_account(
-            &Pubkey::from_str("MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz").unwrap(),
-            &flashloan_base_mint,
-        );
-        accounts.push(AccountMeta::new(token_pda.0, false));
+        let amm_authority = Self::raydium_amm_authority();
+
+        // Get Serum market accounts
+        let (serum_bids, serum_asks, serum_event_queue,
+             serum_coin_vault, serum_pc_vault, serum_vault_signer) =
+            match refresh_manager.get_serum_market(&serum_market) {
+                Some(market) => {
+                    (market.bids, market.asks, market.event_queue,
+                     market.coin_vault, market.pc_vault, market.vault_signer)
+                }
+                None => {
+                    return Err(anyhow!("No Serum market state for {}", serum_market));
+                }
+            };
+
+        let data = Self::encode_raydium_swap_data(amount_in, min_amount_out);
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new_readonly(amm_authority, false),
+                AccountMeta::new(amm_open_orders, false),
+                AccountMeta::new(amm_target_orders, false),
+                AccountMeta::new(coin_vault, false),
+                AccountMeta::new(pc_vault, false),
+                AccountMeta::new_readonly(serum_program_id, false),
+                AccountMeta::new(serum_market, false),
+                AccountMeta::new(serum_bids, false),
+                AccountMeta::new(serum_asks, false),
+                AccountMeta::new(serum_event_queue, false),
+                AccountMeta::new(serum_coin_vault, false),
+                AccountMeta::new(serum_pc_vault, false),
+                AccountMeta::new_readonly(serum_vault_signer, false),
+                AccountMeta::new(user_source, false),
+                AccountMeta::new(user_dest, false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+            ],
+            data,
+        })
     }
 
-    // Check for mixed mode (USDC base)
-    let mut has_usdc_base = false;
-
-    // Check all pools to see if any have USDC as base mint
-    for pool in &mint_pool_data.raydium_pools {
-        if pool.base_mint == usdc_mint {
-            has_usdc_base = true;
-            break;
-        }
-    }
-    if !has_usdc_base {
-        for pool in &mint_pool_data.raydium_cp_pools {
-            if pool.base_mint == usdc_mint {
-                has_usdc_base = true;
-                break;
+    fn build_pump_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        // Get mint from deserialized state
+        let mint = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::Pump { mint, .. }) => *mint,
+            _ => {
+                return Err(anyhow!("No deserialized state for Pump pool {}", pool_address));
             }
+        };
+
+        let bonding_curve_token_account = get_associated_token_address(pool_address, &mint);
+        let user_token_account = self.get_user_ata(&mint);
+        let is_buy = step.action == "buy";
+
+        Ok(Self::build_pump_swap_ix(
+            &pump_program_id(),
+            pool_address,
+            &bonding_curve_token_account,
+            pool_address, // bonding curve is its own SOL holder
+            &user_token_account,
+            &self.payer.pubkey(),
+            amount_in,
+            min_amount_out,
+            is_buy,
+        ))
+    }
+
+    fn build_dlmm_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = meteora_dlmm_program_id();
+
+        let (reserve_x, reserve_y, token_x_mint, token_y_mint) = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::MeteoraDlmm {
+                reserve_x_vault, reserve_y_vault, token_x_mint, token_y_mint, ..
+            }) => {
+                (*reserve_x_vault, *reserve_y_vault, *token_x_mint, *token_y_mint)
+            }
+            _ => {
+                return Err(anyhow!("No deserialized state for DLMM pool {}", pool_address));
+            }
+        };
+
+        // Derive user ATAs
+        let (user_token_in, user_token_out) = if step.action == "buy" {
+            // Buying token_x with token_y (SOL)
+            (self.get_user_ata(&token_y_mint), self.get_user_ata(&token_x_mint))
+        } else {
+            (self.get_user_ata(&token_x_mint), self.get_user_ata(&token_y_mint))
+        };
+
+        // Derive event authority PDA
+        let (event_authority, _) = Pubkey::find_program_address(
+            &[b"__event_authority"],
+            &program_id,
+        );
+
+        // Derive bin array bitmap extension PDA
+        let (bin_array_bitmap_extension, _) = Pubkey::find_program_address(
+            &[b"bitmap", pool_address.as_ref()],
+            &program_id,
+        );
+
+        let mut data = Vec::new();
+        // DLMM swap discriminator (anchor: hash of "global:swap")
+        data.extend_from_slice(&[248, 198, 158, 145, 225, 117, 135, 200]);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new_readonly(bin_array_bitmap_extension, false),
+                AccountMeta::new(reserve_x, false),
+                AccountMeta::new(reserve_y, false),
+                AccountMeta::new(user_token_in, false),
+                AccountMeta::new(user_token_out, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(event_authority, false),
+                AccountMeta::new_readonly(program_id, false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+            ],
+            data,
+        })
+    }
+
+    fn build_damm_v2_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = meteora_damm_v2_program_id();
+
+        let (a_vault, b_vault, token_a_mint, token_b_mint) = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::MeteoraDAmmV2 {
+                a_vault, b_vault, token_a_mint, token_b_mint, ..
+            }) => {
+                (*a_vault, *b_vault, *token_a_mint, *token_b_mint)
+            }
+            _ => {
+                return Err(anyhow!("No deserialized state for DAMM V2 pool {}", pool_address));
+            }
+        };
+
+        // Derive user ATAs
+        let (user_source_token, user_destination_token) = if step.action == "buy" {
+            (self.get_user_ata(&token_b_mint), self.get_user_ata(&token_a_mint))
+        } else {
+            (self.get_user_ata(&token_a_mint), self.get_user_ata(&token_b_mint))
+        };
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[248, 198, 158, 145, 225, 117, 135, 200]); // swap discriminator
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new(a_vault, false),
+                AccountMeta::new(b_vault, false),
+                AccountMeta::new(user_source_token, false),
+                AccountMeta::new(user_destination_token, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+            ],
+            data,
+        })
+    }
+
+    fn build_whirlpool_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = whirlpool_program_id();
+
+        let (vault_a, vault_b, mint_a, mint_b, tick_current_index, tick_spacing) =
+            match refresh_manager.get_pool_state(pool_address) {
+                Some(DeserializedPoolState::WhirlpoolState {
+                    vault_a, vault_b, mint_a, mint_b,
+                    tick_current_index, tick_spacing, ..
+                }) => {
+                    (*vault_a, *vault_b, *mint_a, *mint_b, *tick_current_index, *tick_spacing)
+                }
+                _ => {
+                    return Err(anyhow!("No deserialized state for Whirlpool pool {}", pool_address));
+                }
+            };
+
+        let a_to_b = step.action == "sell"; // selling token A for token B
+
+        // Derive user ATAs
+        let user_token_a = self.get_user_ata(&mint_a);
+        let user_token_b = self.get_user_ata(&mint_b);
+
+        // Derive oracle PDA
+        let (oracle, _) = Pubkey::find_program_address(
+            &[b"oracle", pool_address.as_ref()],
+            &program_id,
+        );
+
+        // Derive tick array PDAs from current tick
+        let ticks_per_array: i32 = tick_spacing as i32 * 88; // Whirlpool uses 88 ticks per array
+        let tick_arrays = Self::derive_whirlpool_tick_arrays(
+            pool_address,
+            &program_id,
+            tick_current_index,
+            ticks_per_array,
+            a_to_b,
+        );
+
+        let mut data = Vec::new();
+        // Whirlpool swap discriminator
+        data.extend_from_slice(&[248, 198, 158, 145, 225, 117, 135, 200]);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+        // sqrt_price_limit (u128): use min/max based on direction
+        let sqrt_price_limit: u128 = if a_to_b {
+            4295048016u128 // MIN_SQRT_PRICE
+        } else {
+            79226673515401279992447579055u128 // MAX_SQRT_PRICE
+        };
+        data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+        // amount_specified_is_input (bool)
+        data.push(1u8);
+        // a_to_b (bool)
+        data.push(if a_to_b { 1 } else { 0 });
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new(user_token_a, false),
+                AccountMeta::new(vault_a, false),
+                AccountMeta::new(user_token_b, false),
+                AccountMeta::new(vault_b, false),
+                AccountMeta::new(tick_arrays[0], false),
+                AccountMeta::new(tick_arrays[1], false),
+                AccountMeta::new(tick_arrays[2], false),
+                AccountMeta::new_readonly(oracle, false),
+            ],
+            data,
+        })
+    }
+
+    fn build_raydium_clmm_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = raydium_clmm_program_id();
+
+        let (vault_0, vault_1, mint_0, mint_1, tick_current, tick_spacing, amm_config, observation_state) =
+            match refresh_manager.get_pool_state(pool_address) {
+                Some(DeserializedPoolState::RaydiumClmm {
+                    vault_0, vault_1, mint_0, mint_1,
+                    tick_current, tick_spacing, amm_config, observation_state, ..
+                }) => {
+                    (*vault_0, *vault_1, *mint_0, *mint_1,
+                     *tick_current, *tick_spacing, *amm_config, *observation_state)
+                }
+                _ => {
+                    return Err(anyhow!("No deserialized state for Raydium CLMM pool {}", pool_address));
+                }
+            };
+
+        let a_to_b = step.action == "sell";
+
+        let user_token_0 = self.get_user_ata(&mint_0);
+        let user_token_1 = self.get_user_ata(&mint_1);
+
+        // Derive tick array PDAs
+        let ticks_per_array: i32 = tick_spacing as i32 * 60; // Raydium CLMM uses 60 ticks per array
+        let tick_arrays = Self::derive_raydium_clmm_tick_arrays(
+            pool_address,
+            &program_id,
+            tick_current,
+            ticks_per_array,
+            a_to_b,
+        );
+
+        // Derive bitmap extension PDA
+        let (bitmap_extension, _) = Pubkey::find_program_address(
+            &[
+                crate::dex::raydium::POOL_TICK_ARRAY_BITMAP_SEED.as_bytes(),
+                pool_address.as_ref(),
+            ],
+            &program_id,
+        );
+
+        // Raydium CLMM swap discriminator
+        let mut data = Vec::new();
+        data.extend_from_slice(&[43, 4, 237, 11, 26, 201, 106, 116]); // swap_v2 discriminator
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+        // sqrt_price_limit_x64 (u128)
+        let sqrt_price_limit: u128 = if a_to_b {
+            4295048016u128
+        } else {
+            79226673515401279992447579055u128
+        };
+        data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+        // is_base_input (bool)
+        data.push(1u8);
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(amm_config, false),
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new(user_token_0, false),
+                AccountMeta::new(user_token_1, false),
+                AccountMeta::new(vault_0, false),
+                AccountMeta::new(vault_1, false),
+                AccountMeta::new(observation_state, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(spl_token_2022::id(), false),
+                // Remaining accounts: tick arrays
+                AccountMeta::new(tick_arrays[0], false),
+                AccountMeta::new(tick_arrays[1], false),
+                AccountMeta::new(tick_arrays[2], false),
+                AccountMeta::new_readonly(bitmap_extension, false),
+            ],
+            data,
+        })
+    }
+
+    /// Derive 3 tick array PDAs for Whirlpool based on current tick and direction
+    fn derive_whirlpool_tick_arrays(
+        pool_address: &Pubkey,
+        program_id: &Pubkey,
+        tick_current: i32,
+        ticks_per_array: i32,
+        a_to_b: bool,
+    ) -> [Pubkey; 3] {
+        let start_index = (tick_current / ticks_per_array) * ticks_per_array;
+
+        let offsets: [i32; 3] = if a_to_b {
+            [0, -ticks_per_array, -2 * ticks_per_array]
+        } else {
+            [0, ticks_per_array, 2 * ticks_per_array]
+        };
+
+        let mut result = [Pubkey::default(); 3];
+        for (i, offset) in offsets.iter().enumerate() {
+            let idx = start_index + offset;
+            let (pda, _) = Pubkey::find_program_address(
+                &[b"tick_array", pool_address.as_ref(), &idx.to_le_bytes()],
+                program_id,
+            );
+            result[i] = pda;
+        }
+        result
+    }
+
+    /// Derive 3 tick array PDAs for Raydium CLMM
+    fn derive_raydium_clmm_tick_arrays(
+        pool_address: &Pubkey,
+        program_id: &Pubkey,
+        tick_current: i32,
+        ticks_per_array: i32,
+        a_to_b: bool,
+    ) -> [Pubkey; 3] {
+        let start_index = if ticks_per_array != 0 {
+            (tick_current / ticks_per_array) * ticks_per_array
+        } else {
+            0
+        };
+
+        let offsets: [i32; 3] = if a_to_b {
+            [0, -ticks_per_array, -2 * ticks_per_array]
+        } else {
+            [0, ticks_per_array, 2 * ticks_per_array]
+        };
+
+        let mut result = [Pubkey::default(); 3];
+        for (i, offset) in offsets.iter().enumerate() {
+            let idx = start_index + offset;
+            let (pda, _) = Pubkey::find_program_address(
+                &[b"tick_array", pool_address.as_ref(), &idx.to_le_bytes()],
+                program_id,
+            );
+            result[i] = pda;
+        }
+        result
+    }
+
+    /// Build Raydium AMM V4 swap instruction (full account set, for direct use)
+    pub fn build_raydium_swap_ix(
+        program_id: &Pubkey,
+        amm_id: &Pubkey,
+        amm_authority: &Pubkey,
+        amm_open_orders: &Pubkey,
+        amm_target_orders: &Pubkey,
+        pool_coin_vault: &Pubkey,
+        pool_pc_vault: &Pubkey,
+        serum_program: &Pubkey,
+        serum_market: &Pubkey,
+        serum_bids: &Pubkey,
+        serum_asks: &Pubkey,
+        serum_event_queue: &Pubkey,
+        serum_coin_vault: &Pubkey,
+        serum_pc_vault: &Pubkey,
+        serum_vault_signer: &Pubkey,
+        user_source: &Pubkey,
+        user_destination: &Pubkey,
+        user_owner: &Pubkey,
+        amount_in: u64,
+        minimum_amount_out: u64,
+    ) -> Instruction {
+        let data = Self::encode_raydium_swap_data(amount_in, minimum_amount_out);
+
+        Instruction {
+            program_id: *program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(*amm_id, false),
+                AccountMeta::new_readonly(*amm_authority, false),
+                AccountMeta::new(*amm_open_orders, false),
+                AccountMeta::new(*amm_target_orders, false),
+                AccountMeta::new(*pool_coin_vault, false),
+                AccountMeta::new(*pool_pc_vault, false),
+                AccountMeta::new_readonly(*serum_program, false),
+                AccountMeta::new(*serum_market, false),
+                AccountMeta::new(*serum_bids, false),
+                AccountMeta::new(*serum_asks, false),
+                AccountMeta::new(*serum_event_queue, false),
+                AccountMeta::new(*serum_coin_vault, false),
+                AccountMeta::new(*serum_pc_vault, false),
+                AccountMeta::new_readonly(*serum_vault_signer, false),
+                AccountMeta::new(*user_source, false),
+                AccountMeta::new(*user_destination, false),
+                AccountMeta::new_readonly(*user_owner, true),
+            ],
+            data,
         }
     }
-    // Check other pool types as needed...
 
-    // If mixed mode is detected, add the required accounts
-    if has_usdc_base {
-        let wallet_usdc_account =
-            spl_associated_token_account::get_associated_token_address(&wallet, &usdc_mint);
-        let raydium_sol_usdc_pool =
-            Pubkey::from_str("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").unwrap();
-        let raydium_usdc_vault =
-            Pubkey::from_str("HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz").unwrap();
-        let raydium_sol_vault =
-            Pubkey::from_str("DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz").unwrap();
-
-        accounts.push(AccountMeta::new_readonly(usdc_mint, false));
-        accounts.push(AccountMeta::new(wallet_usdc_account, false));
-        accounts.push(AccountMeta::new_readonly(raydium_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(raydium_authority(), false));
-        accounts.push(AccountMeta::new_readonly(sysvar_instructions, false));
-        accounts.push(AccountMeta::new(raydium_sol_usdc_pool, false));
-        accounts.push(AccountMeta::new(raydium_usdc_vault, false));
-        accounts.push(AccountMeta::new(raydium_sol_vault, false));
+    fn encode_raydium_swap_data(amount_in: u64, minimum_amount_out: u64) -> Vec<u8> {
+        let mut data = vec![9u8]; // Raydium swap discriminator
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+        data
     }
 
-    // Add token mint and pools
-    accounts.push(AccountMeta::new_readonly(mint_pool_data.mint, false));
-    accounts.push(AccountMeta::new_readonly(
-        mint_pool_data.token_program,
-        false,
-    )); // Token program (SPL Token or Token 2022)
-    let wallet_x_account =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            &wallet,
-            &mint_pool_data.mint,
-            &mint_pool_data.token_program,
+    /// Build Pump.fun swap instruction
+    pub fn build_pump_swap_ix(
+        program_id: &Pubkey,
+        bonding_curve: &Pubkey,
+        bonding_curve_token_account: &Pubkey,
+        bonding_curve_sol_account: &Pubkey,
+        user_token_account: &Pubkey,
+        user: &Pubkey,
+        amount: u64,
+        min_out: u64,
+        is_buy: bool,
+    ) -> Instruction {
+        let mut data = Vec::new();
+        if is_buy {
+            data.extend_from_slice(&[0u8; 8]);
+        } else {
+            data.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+
+        Instruction {
+            program_id: *program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(*bonding_curve, false),
+                AccountMeta::new(*bonding_curve_token_account, false),
+                AccountMeta::new(*bonding_curve_sol_account, false),
+                AccountMeta::new(*user_token_account, false),
+                AccountMeta::new(*user, true),
+            ],
+            data,
+        }
+    }
+
+    pub fn payer_pubkey(&self) -> Pubkey {
+        self.payer.pubkey()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transaction_builder_creation() {
+        let rpc = Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string()));
+        let payer = Arc::new(Keypair::new());
+        let builder = TransactionBuilder::new(
+            rpc, payer, 400_000, 10_000, vec![], false,
         );
-    accounts.push(AccountMeta::new(wallet_x_account, false));
-
-    // Add Raydium pools
-    for pool in &mint_pool_data.raydium_pools {
-        accounts.push(AccountMeta::new_readonly(raydium_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(raydium_authority(), false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.token_vault, false));
-        accounts.push(AccountMeta::new(pool.sol_vault, false));
+        assert!(!builder.real_execution);
     }
 
-    // Add Raydium CP pools
-    for pool in &mint_pool_data.raydium_cp_pools {
-        accounts.push(AccountMeta::new_readonly(raydium_cp_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(raydium_cp_authority(), false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new_readonly(pool.amm_config, false));
-        accounts.push(AccountMeta::new(pool.token_vault, false));
-        accounts.push(AccountMeta::new(pool.sol_vault, false));
-        accounts.push(AccountMeta::new(pool.observation, false));
+    #[test]
+    fn test_raydium_swap_data_encoding() {
+        let data = TransactionBuilder::encode_raydium_swap_data(1000, 900);
+        assert_eq!(data[0], 9);
+        assert_eq!(data.len(), 1 + 8 + 8);
+        let amount_in = u64::from_le_bytes(data[1..9].try_into().unwrap());
+        let min_out = u64::from_le_bytes(data[9..17].try_into().unwrap());
+        assert_eq!(amount_in, 1000);
+        assert_eq!(min_out, 900);
     }
 
-    // Add Pump pools
-    for pool in &mint_pool_data.pump_pools {
-        accounts.push(AccountMeta::new_readonly(pump_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(pump_global_config, false));
-        accounts.push(AccountMeta::new_readonly(pump_authority, false));
-        accounts.push(AccountMeta::new(pump_fee_wallet(), false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.token_vault, false));
-        accounts.push(AccountMeta::new(pool.sol_vault, false));
-        accounts.push(AccountMeta::new(pool.fee_token_wallet, false));
-        accounts.push(AccountMeta::new(pool.coin_creator_vault_ata, false));
-        accounts.push(AccountMeta::new_readonly(
-            pool.coin_creator_vault_authority,
+    #[test]
+    fn test_pump_swap_ix_buy() {
+        let ix = TransactionBuilder::build_pump_swap_ix(
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            1000,
+            900,
+            true,
+        );
+        assert_eq!(ix.data[0..8], [0u8; 8]); // buy discriminator
+    }
+
+    #[test]
+    fn test_pump_swap_ix_sell() {
+        let ix = TransactionBuilder::build_pump_swap_ix(
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            1000,
+            900,
             false,
-        ));
-        let pump_program_id =
-            Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
-        let (global_volume_accumulator, _) =
-            Pubkey::find_program_address(&[b"global_volume_accumulator"], &pump_program_id);
-        let (user_volume_accumulator, _) = Pubkey::find_program_address(
-            &[b"user_volume_accumulator", wallet.as_ref()],
-            &pump_program_id,
         );
-        accounts.push(AccountMeta::new(global_volume_accumulator, false));
-        accounts.push(AccountMeta::new(user_volume_accumulator, false));
+        assert_eq!(ix.data[0], 1); // sell discriminator
     }
 
-    // Add DLMM pairs
-    for pair in &mint_pool_data.dlmm_pairs {
-        accounts.push(AccountMeta::new_readonly(dlmm_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pair.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(dlmm_event_authority(), false));
-        if let Some(memo_program) = pair.memo_program {
-            accounts.push(AccountMeta::new_readonly(memo_program, false));
-        }
-        accounts.push(AccountMeta::new(pair.pair, false));
-        accounts.push(AccountMeta::new(pair.token_vault, false));
-        accounts.push(AccountMeta::new(pair.sol_vault, false));
-        accounts.push(AccountMeta::new(pair.oracle, false));
-        for bin_array in &pair.bin_arrays {
-            accounts.push(AccountMeta::new(*bin_array, false));
-        }
+    #[test]
+    fn test_user_ata_derivation() {
+        let rpc = Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string()));
+        let payer = Arc::new(Keypair::new());
+        let builder = TransactionBuilder::new(rpc, payer.clone(), 400_000, 10_000, vec![], false);
+
+        let mint = Pubkey::new_unique();
+        let ata = builder.get_user_ata(&mint);
+        let expected = get_associated_token_address(&payer.pubkey(), &mint);
+        assert_eq!(ata, expected);
     }
 
-    // Add Whirlpool pools
-    for pool in &mint_pool_data.whirlpool_pools {
-        accounts.push(AccountMeta::new_readonly(whirlpool_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(memo_program, false)); // Always add memo program for Whirlpool
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.oracle, false)); // Oracle NEEDS to be writable for Whirlpool
-        accounts.push(AccountMeta::new(pool.x_vault, false));
-        accounts.push(AccountMeta::new(pool.y_vault, false));
-        for tick_array in &pool.tick_arrays {
-            accounts.push(AccountMeta::new(*tick_array, false));
-        }
+    #[test]
+    fn test_raydium_amm_authority() {
+        let authority = TransactionBuilder::raydium_amm_authority();
+        // Should be deterministic
+        let authority2 = TransactionBuilder::raydium_amm_authority();
+        assert_eq!(authority, authority2);
     }
 
-    // Add Raydium CLMM pools
-    for pool in &mint_pool_data.raydium_clmm_pools {
-        accounts.push(AccountMeta::new_readonly(raydium_clmm_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        if let Some(memo_program) = pool.memo_program {
-            accounts.push(AccountMeta::new_readonly(memo_program, false));
-        }
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new_readonly(pool.amm_config, false));
-        accounts.push(AccountMeta::new(pool.observation_state, false));
-        accounts.push(AccountMeta::new(pool.bitmap_extension, false));
-        accounts.push(AccountMeta::new(pool.x_vault, false));
-        accounts.push(AccountMeta::new(pool.y_vault, false));
-        for tick_array in &pool.tick_arrays {
-            accounts.push(AccountMeta::new(*tick_array, false));
-        }
+    #[test]
+    fn test_whirlpool_tick_array_derivation() {
+        let pool = Pubkey::new_unique();
+        let program = whirlpool_program_id();
+        let arrays = TransactionBuilder::derive_whirlpool_tick_arrays(
+            &pool, &program, 100, 5632, true,
+        );
+        // All three should be different
+        assert_ne!(arrays[0], arrays[1]);
+        assert_ne!(arrays[1], arrays[2]);
     }
-
-    // Add Meteora DAMM pools
-    for pool in &mint_pool_data.meteora_damm_pools {
-        accounts.push(AccountMeta::new_readonly(damm_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(vault_program_id(), false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_vault, false));
-        accounts.push(AccountMeta::new(pool.token_x_token_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_token_vault, false));
-        accounts.push(AccountMeta::new(pool.token_x_lp_mint, false));
-        accounts.push(AccountMeta::new(pool.token_sol_lp_mint, false));
-        accounts.push(AccountMeta::new(pool.token_x_pool_lp, false));
-        accounts.push(AccountMeta::new(pool.token_sol_pool_lp, false));
-        accounts.push(AccountMeta::new(pool.admin_token_fee_x, false));
-        accounts.push(AccountMeta::new(pool.admin_token_fee_sol, false));
-    }
-
-    // Add Meteora DAMM V2 pools
-    for pool in &mint_pool_data.meteora_damm_v2_pools {
-        accounts.push(AccountMeta::new_readonly(damm_v2_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(damm_v2_event_authority(), false));
-        accounts.push(AccountMeta::new_readonly(damm_v2_pool_authority(), false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_vault, false));
-    }
-
-    // Add Solfi pools
-    for pool in &mint_pool_data.solfi_pools {
-        accounts.push(AccountMeta::new_readonly(solfi_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new_readonly(sysvar_instructions, false));
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_vault, false));
-    }
-
-    // Add Vertigo pools
-    for pool in &mint_pool_data.vertigo_pools {
-        accounts.push(AccountMeta::new_readonly(vertigo_program_id(), false));
-        accounts.push(AccountMeta::new_readonly(pool.base_mint, false)); // V9: Add base mint
-        accounts.push(AccountMeta::new(pool.pool, false));
-        accounts.push(AccountMeta::new_readonly(pool.pool_owner, false));
-        accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_vault, false));
-    }
-
-    // Create instruction data
-    let mut data = vec![28u8];
-
-    let minimum_profit: u64 = 0;
-    // When true, the bot will not fail the transaction even when it can't find a profitable arbitrage. It will just do nothing and succeed.
-    let no_failure_mode = false;
-
-    data.extend_from_slice(&minimum_profit.to_le_bytes());
-    data.extend_from_slice(&compute_unit_limit.to_le_bytes());
-    data.extend_from_slice(if no_failure_mode { &[1] } else { &[0] });
-    data.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    data.extend_from_slice(if use_flashloan { &[1] } else { &[0] });
-
-    Ok(Instruction {
-        program_id: executor_program_id,
-        accounts,
-        data,
-    })
 }

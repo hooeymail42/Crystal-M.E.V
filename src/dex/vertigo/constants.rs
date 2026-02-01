@@ -1,4 +1,4 @@
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
 pub fn vertigo_program_id() -> Pubkey {
