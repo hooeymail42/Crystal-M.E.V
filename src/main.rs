@@ -8,8 +8,9 @@ use solana_sdk::signature::Keypair;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
-use anyhow::Result;
-use tracing::{info, warn};
+use anyhow::{Result, bail};
+use tracing::{info, warn, error};
+use spl_associated_token_account::get_associated_token_address;
 
 use crate::config::BotConfig;
 use crate::chain::pools::{MintPoolData, PoolData};
@@ -18,6 +19,10 @@ use crate::chain::refresh::PoolRefreshManager;
 use crate::chain::transaction::TransactionBuilder;
 use crate::chain::wallet_integration::WalletConfig;
 use crate::chain::constants::SOL_MINT;
+use crate::chain::trade_logger::{TradeLogger, ExecutedTrade};
+use crate::chain::gas_fee::GasFeeConfig;
+use crate::chain::volume_weighted_slippage::VolumeWeightedSlippagePredictor;
+use crate::chain::pool_subscription::{WebSocketPoolSubscriber, RawAccountUpdate, start_websocket_subscriber};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,14 +52,15 @@ async fn main() -> Result<()> {
             WalletConfig::test_wallet()
         })
     };
-    info!("Wallet: {}", wallet.address());
+    let wallet_address = wallet.address();
+    info!("Wallet: {}", wallet_address);
 
-    match rpc.get_balance(&wallet.address()) {
+    match rpc.get_balance(&wallet_address) {
         Ok(balance) => info!("Wallet balance: {:.4} SOL", balance as f64 / 1e9),
         Err(e) => warn!("Could not fetch balance: {}", e),
     }
 
-    let payer = Arc::new(Keypair::new());
+    let payer = Arc::new(wallet.keypair);
 
     let tx_builder = TransactionBuilder::new(
         rpc.clone(),
@@ -63,7 +69,17 @@ async fn main() -> Result<()> {
         config.priority_fee_lamports,
         config.spam_rpc_urls.clone(),
         config.enable_real_execution,
+    )
+    .with_jito(
+        config.jito_enabled,
+        config.jito_tip_lamports,
+        config.jito_block_engine_url.clone(),
     );
+
+    if config.jito_enabled {
+        info!("Jito MEV bundles enabled: tip={} lamports, engine={}",
+            config.jito_tip_lamports, config.jito_block_engine_url);
+    }
 
     let mut refresh_manager = PoolRefreshManager::new(rpc.clone());
 
@@ -73,7 +89,7 @@ async fn main() -> Result<()> {
     for mint_config in &config.mints {
         let mut mpd = MintPoolData::new(
             &mint_config.mint.to_string(),
-            &wallet.address().to_string(),
+            &wallet_address.to_string(),
             spl_token::id(),
         )?;
 
@@ -175,6 +191,17 @@ async fn main() -> Result<()> {
         mint_pool_datas.push(mpd);
     }
 
+    // Initialize trade logger
+    let trade_logger = TradeLogger::new("trades.csv");
+    info!("Trade logger initialized: {}", trade_logger.get_file_path());
+
+    // Initialize gas fee config
+    let gas_fee_config = GasFeeConfig::default();
+    info!("Gas fee config: min_profit={:.4} SOL, aggressive={}", gas_fee_config.min_profit_to_execute_sol, gas_fee_config.aggressive_mode);
+
+    // Initialize volume-weighted slippage predictor
+    let slippage_predictor = VolumeWeightedSlippagePredictor::new("Raydium".to_string());
+
     let opp_config = OpportunityConfig {
         min_profit_percent: config.min_profit_sol * 100.0,
         min_liquidity_sol: 1.0,
@@ -183,7 +210,47 @@ async fn main() -> Result<()> {
     };
 
     let slippage_bps = (config.max_slippage_pct * 100.0) as u64; // convert % to bps
-    let user_token_accounts: HashMap<String, Pubkey> = HashMap::new();
+
+    // Pre-create ATAs for all token mints
+    let mut user_token_accounts: HashMap<String, Pubkey> = HashMap::new();
+    let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
+    let wsol_ata = get_associated_token_address(&wallet_address, &sol_mint_pubkey);
+    user_token_accounts.insert(SOL_MINT.to_string(), wsol_ata);
+    info!("WSOL ATA: {}", wsol_ata);
+
+    for mpd in &mint_pool_datas {
+        let ata = get_associated_token_address(&wallet_address, &mpd.mint);
+        user_token_accounts.insert(mpd.mint.to_string(), ata);
+        info!("ATA for mint {}: {}", mpd.mint, ata);
+    }
+    info!("Pre-derived {} user token accounts", user_token_accounts.len());
+
+    // Start WebSocket pool subscriber if WS URL is configured
+    let mut ws_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RawAccountUpdate>> = None;
+    if !config.ws_url.is_empty() {
+        let mut ws_subscriber = WebSocketPoolSubscriber::new(config.ws_url.clone());
+
+        // Register all pool addresses with their DEX names
+        for mpd in &mint_pool_datas {
+            for pool in &mpd.pools {
+                ws_subscriber.add_pool(*pool.pool_address(), pool.get_dex_name().to_string());
+            }
+        }
+
+        let pool_count = ws_subscriber.pool_count();
+        if pool_count > 0 {
+            let rx = start_websocket_subscriber(ws_subscriber);
+            ws_update_rx = Some(rx);
+            info!("WebSocket subscriber started for {} pools (ws_url={})", pool_count, config.ws_url);
+        } else {
+            info!("No pools to subscribe via WebSocket");
+        }
+    } else {
+        info!("WS_URL not configured, WebSocket subscriptions disabled");
+    }
+
+    let spam_enabled = config.spam_enabled;
+    let has_spam_rpcs = !config.spam_rpc_urls.is_empty();
 
     info!("Starting main trading loop (interval={}ms)", config.loop_interval_ms);
 
@@ -197,10 +264,58 @@ async fn main() -> Result<()> {
     let mut loop_count: u64 = 0;
     let mut total_opportunities: u64 = 0;
     let mut total_executions: u64 = 0;
+    let mut consecutive_failures: u32 = 0;
+    let mut circuit_breaker_until: Option<tokio::time::Instant> = None;
 
     loop {
         interval.tick().await;
         loop_count += 1;
+
+        // Circuit breaker: if paused, skip this iteration
+        if let Some(resume_at) = circuit_breaker_until {
+            if tokio::time::Instant::now() < resume_at {
+                if loop_count % 10 == 0 {
+                    warn!("[Circuit Breaker] Trading paused due to {} consecutive failures, waiting...", consecutive_failures);
+                }
+                continue;
+            } else {
+                info!("[Circuit Breaker] Pause period ended, resuming trading");
+                circuit_breaker_until = None;
+            }
+        }
+
+        // Periodic balance monitoring (every 50 loops)
+        if loop_count % 50 == 0 {
+            match rpc.get_balance(&wallet_address) {
+                Ok(balance) => {
+                    let sol_balance = balance as f64 / 1e9;
+                    info!("[Loop {}] Wallet balance: {:.4} SOL", loop_count, sol_balance);
+                    if sol_balance < 0.01 {
+                        warn!("[Loop {}] Balance too low ({:.4} SOL < 0.01 SOL), skipping trading this iteration", loop_count, sol_balance);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    warn!("[Loop {}] Could not fetch balance: {}", loop_count, e);
+                }
+            }
+        }
+
+        // Drain pending WebSocket updates and apply to refresh manager
+        if let Some(ref mut rx) = ws_update_rx {
+            let mut ws_updates_applied = 0u32;
+            while let Ok(update) = rx.try_recv() {
+                refresh_manager.apply_account_update(
+                    update.pool_address,
+                    &update.dex_name,
+                    &update.data,
+                );
+                ws_updates_applied += 1;
+            }
+            if ws_updates_applied > 0 && loop_count % 20 == 0 {
+                info!("[Loop {}] Applied {} WebSocket pool updates", loop_count, ws_updates_applied);
+            }
+        }
 
         // Full refresh: deserialize pool accounts + fetch vault balances
         for mpd in &mint_pool_datas {
@@ -242,11 +357,43 @@ async fn main() -> Result<()> {
 
                 // Execute best opportunity
                 if let Some(best) = opportunities.first() {
-                    let est_gas_cost = config.priority_fee_lamports as f64 / 1e9;
+                    let num_hops = best.path.len();
+                    let buy_dex = best.path.first().map(|p| p.dex.as_str()).unwrap_or("unknown");
+                    let sell_dex = best.path.last().map(|p| p.dex.as_str()).unwrap_or("unknown");
+
+                    // Use gas fee config for cost estimation
+                    let mut est_gas_cost = gas_fee_config.estimate_cost_sol(buy_dex, num_hops);
+                    if config.jito_enabled {
+                        est_gas_cost += config.jito_tip_lamports as f64 / 1e9;
+                    }
                     let net_profit = best.gross_profit_sol - est_gas_cost;
 
-                    if net_profit > config.min_profit_sol {
-                        info!("Profitable after gas: net={:.6} SOL, building TX...", net_profit);
+                    // Use gas fee config's should_execute check
+                    if gas_fee_config.should_execute(net_profit, num_hops) {
+                        // Apply slippage prediction filter if volume data is available
+                        let mut skip_due_to_slippage = false;
+                        if !best.pool_addresses.is_empty() {
+                            if let Ok(pool_pubkey) = Pubkey::from_str(&best.pool_addresses[0]) {
+                                if let Ok(predicted_slippage) = slippage_predictor.predict_slippage(
+                                    pool_pubkey,
+                                    best.input_amount_sol,
+                                    best.expected_output_sol,
+                                ) {
+                                    if predicted_slippage > opp_config.max_slippage_percent {
+                                        info!("Skipping: predicted slippage {:.2}% > max {:.2}%",
+                                            predicted_slippage, opp_config.max_slippage_percent);
+                                        skip_due_to_slippage = true;
+                                    }
+                                }
+                                // If predict_slippage fails (no volume history), proceed without filter
+                            }
+                        }
+
+                        if skip_due_to_slippage {
+                            continue;
+                        }
+
+                        info!("Profitable after gas: net={:.6} SOL (gas={:.6} SOL), building TX...", net_profit, est_gas_cost);
 
                         // Build swap instructions from opportunity path
                         match tx_builder.build_instructions_from_opportunity(
@@ -260,20 +407,117 @@ async fn main() -> Result<()> {
 
                                 match tx_builder.get_recent_blockhash() {
                                     Ok(blockhash) => {
-                                        match tx_builder.build_swap_transaction(swap_ixs, blockhash) {
+                                        // Build transaction: flash loan > Jito bundle > regular
+                                        let tx_result = if config.flashloan_enabled
+                                            && !config.flashloan_reserve.is_empty()
+                                            && !config.flashloan_reserve_vault.is_empty()
+                                            && !config.flashloan_fee_receiver.is_empty()
+                                        {
+                                            let fl_reserve = Pubkey::from_str(&config.flashloan_reserve).unwrap();
+                                            let fl_vault = Pubkey::from_str(&config.flashloan_reserve_vault).unwrap();
+                                            let fl_fee = Pubkey::from_str(&config.flashloan_fee_receiver).unwrap();
+                                            let borrow_lamports = (best.input_amount_sol * 1e9) as u64;
+                                            info!("Using Kamino flash loan: borrow={:.4} SOL", best.input_amount_sol);
+                                            tx_builder.build_flashloan_transaction(
+                                                swap_ixs, borrow_lamports, &fl_reserve, &fl_vault, &fl_fee, blockhash,
+                                            )
+                                        } else if tx_builder.is_jito_enabled() {
+                                            tx_builder.build_jito_bundle(swap_ixs, blockhash)
+                                        } else {
+                                            tx_builder.build_swap_transaction(swap_ixs, blockhash)
+                                        };
+                                        match tx_result {
                                             Ok(tx) => {
                                                 match tx_builder.simulate(&tx) {
                                                     Ok(true) => {
                                                         info!("Simulation passed, executing...");
-                                                        match tx_builder.send_and_confirm(&tx) {
+                                                        // Submit via Jito bundle, parallel spam, or standard RPC
+                                                let send_result = if tx_builder.is_jito_enabled() {
+                                                    tx_builder.submit_jito_bundle(&tx)
+                                                } else if spam_enabled && has_spam_rpcs {
+                                                    tx_builder.parallel_submit(&tx).await
+                                                } else {
+                                                    tx_builder.send_and_confirm(&tx)
+                                                };
+                                                match send_result {
                                                             Ok(sig) => {
                                                                 total_executions += 1;
+                                                                consecutive_failures = 0;
                                                                 info!("TX confirmed: {} (total executions: {})", sig, total_executions);
+
+                                                                let trade = ExecutedTrade {
+                                                                    timestamp: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                                                                    token_mint: best.token_mint.clone(),
+                                                                    buy_dex: buy_dex.to_string(),
+                                                                    sell_dex: sell_dex.to_string(),
+                                                                    input_sol: best.input_amount_sol,
+                                                                    expected_profit_sol: best.gross_profit_sol,
+                                                                    expected_profit_pct: best.profit_percent,
+                                                                    tx_signature: sig.to_string(),
+                                                                    status: "success".to_string(),
+                                                                    actual_profit_sol: Some(net_profit),
+                                                                    notes: format!("hops={} confidence={}", num_hops, best.confidence_score),
+                                                                };
+                                                                if let Err(e) = trade_logger.log_trade(&trade) {
+                                                                    warn!("Failed to log successful trade: {}", e);
+                                                                }
                                                             }
-                                                            Err(e) => warn!("TX send failed: {}", e),
+                                                            Err(e) => {
+                                                                consecutive_failures += 1;
+                                                                warn!("TX send failed (consecutive_failures={}): {}", consecutive_failures, e);
+                                                                if consecutive_failures >= 50 {
+                                                                    error!("Circuit breaker: 50 consecutive failures, shutting down");
+                                                                    bail!("Circuit breaker triggered: 50 consecutive failures");
+                                                                } else if consecutive_failures >= 10 {
+                                                                    warn!("Circuit breaker: {} consecutive failures, pausing for 30s", consecutive_failures);
+                                                                    circuit_breaker_until = Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(30));
+                                                                }
+                                                                let trade = ExecutedTrade {
+                                                                    timestamp: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                                                                    token_mint: best.token_mint.clone(),
+                                                                    buy_dex: buy_dex.to_string(),
+                                                                    sell_dex: sell_dex.to_string(),
+                                                                    input_sol: best.input_amount_sol,
+                                                                    expected_profit_sol: best.gross_profit_sol,
+                                                                    expected_profit_pct: best.profit_percent,
+                                                                    tx_signature: String::new(),
+                                                                    status: "failed".to_string(),
+                                                                    actual_profit_sol: None,
+                                                                    notes: format!("TX send error: {}", e),
+                                                                };
+                                                                if let Err(le) = trade_logger.log_trade(&trade) {
+                                                                    warn!("Failed to log failed trade: {}", le);
+                                                                }
+                                                            }
                                                         }
                                                     }
-                                                    Ok(false) => warn!("Simulation failed, skipping"),
+                                                    Ok(false) => {
+                                                        consecutive_failures += 1;
+                                                        warn!("Simulation failed (consecutive_failures={}), skipping", consecutive_failures);
+                                                        if consecutive_failures >= 50 {
+                                                            error!("Circuit breaker: 50 consecutive failures, shutting down");
+                                                            bail!("Circuit breaker triggered: 50 consecutive failures");
+                                                        } else if consecutive_failures >= 10 {
+                                                            warn!("Circuit breaker: {} consecutive failures, pausing for 30s", consecutive_failures);
+                                                            circuit_breaker_until = Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(30));
+                                                        }
+                                                        let trade = ExecutedTrade {
+                                                            timestamp: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                                                            token_mint: best.token_mint.clone(),
+                                                            buy_dex: buy_dex.to_string(),
+                                                            sell_dex: sell_dex.to_string(),
+                                                            input_sol: best.input_amount_sol,
+                                                            expected_profit_sol: best.gross_profit_sol,
+                                                            expected_profit_pct: best.profit_percent,
+                                                            tx_signature: String::new(),
+                                                            status: "failed".to_string(),
+                                                            actual_profit_sol: None,
+                                                            notes: "Simulation failed".to_string(),
+                                                        };
+                                                        if let Err(e) = trade_logger.log_trade(&trade) {
+                                                            warn!("Failed to log failed trade: {}", e);
+                                                        }
+                                                    }
                                                     Err(e) => warn!("Simulation error: {}", e),
                                                 }
                                             }
@@ -297,6 +541,9 @@ async fn main() -> Result<()> {
                 "[Status] Loop={}, Opportunities={}, Executions={}, Mints={}",
                 loop_count, total_opportunities, total_executions, mint_pool_datas.len()
             );
+            if let Err(e) = trade_logger.print_summary() {
+                warn!("Failed to print trade summary: {}", e);
+            }
         }
     }
 }

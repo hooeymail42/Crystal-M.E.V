@@ -40,11 +40,11 @@ impl SerumMarketState {
     ///   coin_vault(32), coin_deposits(8), coin_fees(8),
     ///   pc_vault(32), pc_deposits(8), pc_fees(8),
     ///   vault_signer_nonce is at offset 45,
-    ///   coin_vault at offset 53, pc_vault at offset 101,
-    ///   req_queue at offset 149, event_queue at offset 181,
-    ///   bids at offset 213, asks at offset 245
+    ///   coin_vault at offset 117, pc_vault at offset 165,
+    ///   req_queue at offset 213, event_queue at offset 245,
+    ///   bids at offset 277, asks at offset 309
     pub fn try_parse(data: &[u8], serum_program: &Pubkey, market: &Pubkey) -> Option<Self> {
-        if data.len() < 277 {
+        if data.len() < 341 {
             return None;
         }
 
@@ -63,15 +63,11 @@ impl SerumMarketState {
             d[45..53].try_into().ok()?
         );
 
-        let coin_vault = read_pubkey_at!(53);
-        // pc_vault: after coin_vault(32) + coin_deposits_total(8) + coin_fees_accrued(8) = offset 53+48=101
-        let pc_vault = read_pubkey_at!(101);
-        // event_queue: offset 181
-        let event_queue = read_pubkey_at!(181);
-        // bids: offset 213
-        let bids = read_pubkey_at!(213);
-        // asks: offset 245
-        let asks = read_pubkey_at!(245);
+        let coin_vault = read_pubkey_at!(117);
+        let pc_vault = read_pubkey_at!(165);
+        let event_queue = read_pubkey_at!(245);
+        let bids = read_pubkey_at!(277);
+        let asks = read_pubkey_at!(309);
 
         // Derive vault signer PDA
         let vault_signer = Pubkey::create_program_address(
@@ -514,6 +510,16 @@ impl PoolRefreshManager {
         }
 
         Ok(self.reserves.len())
+    }
+
+    /// Apply a raw WebSocket account update to the pool state cache.
+    /// This reuses the same DEX-specific deserialization as `refresh_pool_states`.
+    pub fn apply_account_update(&mut self, pool_address: Pubkey, dex_name: &str, data: &[u8]) {
+        if data.len() <= 8 {
+            return;
+        }
+        let state = self.deserialize_pool_account(dex_name, data);
+        self.pool_states.insert(pool_address, state);
     }
 
     /// Start an async refresh loop

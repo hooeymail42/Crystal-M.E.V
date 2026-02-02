@@ -1,4 +1,3 @@
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,6 +5,14 @@ use tokio::sync::{RwLock, mpsc};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use chrono::Utc;
+use tracing::{info, warn, error, debug};
+use futures::stream::StreamExt;
+use futures::SinkExt;
+use tokio_tungstenite::tungstenite::Message;
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PoolStateUpdate {
@@ -20,54 +27,34 @@ pub struct PoolStateUpdate {
     pub slot: u64,
 }
 
+/// Raw account update received from the WebSocket before DEX-specific parsing.
+#[derive(Clone, Debug)]
+pub struct RawAccountUpdate {
+    pub pool_address: Pubkey,
+    pub data: Vec<u8>,
+    pub slot: u64,
+    pub dex_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// PoolSubscriptionManager  (in-memory cache, unchanged public API)
+// ---------------------------------------------------------------------------
+
 pub struct PoolSubscriptionManager {
-    rpc: Arc<RpcClient>,
     pools: Arc<RwLock<HashMap<Pubkey, PoolStateUpdate>>>,
     update_tx: mpsc::UnboundedSender<PoolStateUpdate>,
     update_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PoolStateUpdate>>>,
 }
 
 impl PoolSubscriptionManager {
-    pub fn new(rpc: Arc<RpcClient>) -> Self {
+    pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
 
         Self {
-            rpc,
             pools: Arc::new(RwLock::new(HashMap::new())),
             update_tx: tx,
             update_rx: Arc::new(tokio::sync::Mutex::new(rx)),
         }
-    }
-
-    pub async fn subscribe_to_pool(&self, pool_address: Pubkey) -> Result<()> {
-        let _account = self.rpc.get_account(&pool_address)?;
-        
-        let initial_state = PoolStateUpdate {
-            pool_address,
-            token_a: Pubkey::default(),
-            token_b: Pubkey::default(),
-            reserve_a: 0,
-            reserve_b: 0,
-            price: 0.0,
-            liquidity: 0.0,
-            timestamp: Utc::now().timestamp(),
-            slot: 0,
-        };
-
-        let mut pools = self.pools.write().await;
-        pools.insert(pool_address, initial_state.clone());
-
-        let _ = self.update_tx.send(initial_state);
-        
-        println!("✅ Subscribed to pool: {}", pool_address);
-        Ok(())
-    }
-
-    pub async fn subscribe_to_pools(&self, pool_addresses: Vec<Pubkey>) -> Result<()> {
-        for address in pool_addresses {
-            self.subscribe_to_pool(address).await?;
-        }
-        Ok(())
     }
 
     pub async fn get_pool_state(&self, pool_address: Pubkey) -> Result<PoolStateUpdate> {
@@ -85,28 +72,14 @@ impl PoolSubscriptionManager {
     pub async fn update_pool_state(&self, update: PoolStateUpdate) -> Result<()> {
         let mut pools = self.pools.write().await;
         pools.insert(update.pool_address, update.clone());
-        
         let _ = self.update_tx.send(update);
-        Ok(())
-    }
-
-    pub async fn listen_for_updates(&self) -> Result<()> {
-        let mut rx = self.update_rx.lock().await;
-        
-        println!("👂 Listening for pool updates...");
-        
-        while let Some(update) = rx.recv().await {
-            println!("📊 Pool {} updated: price={:.6}, liquidity={:.2}", 
-                update.pool_address, update.price, update.liquidity);
-        }
-
         Ok(())
     }
 
     pub async fn get_recent_updates(&self, seconds: i64) -> Result<Vec<PoolStateUpdate>> {
         let now = Utc::now().timestamp();
         let pools = self.pools.read().await;
-        
+
         let recent = pools
             .values()
             .filter(|p| (now - p.timestamp) <= seconds)
@@ -116,104 +89,268 @@ impl PoolSubscriptionManager {
         Ok(recent)
     }
 
-    pub async fn detect_price_changes(&self, _threshold_percent: f64) -> Result<Vec<(Pubkey, f64, f64)>> {
-        let pools = self.pools.read().await;
-        let mut changes = Vec::new();
-
-        for update in pools.values() {
-            if update.liquidity > 10000.0 {
-                changes.push((update.pool_address, update.price, update.liquidity));
-            }
-        }
-
-        Ok(changes)
-    }
-
-    pub async fn estimate_next_block_opportunities(&self) -> Result<Vec<String>> {
-        let pools = self.pools.read().await;
-        let mut opportunities = Vec::new();
-
-        let pools_vec: Vec<_> = pools.values().collect();
-        
-        for i in 0..pools_vec.len() {
-            for j in (i + 1)..pools_vec.len() {
-                let spread = (pools_vec[i].price - pools_vec[j].price).abs();
-                if spread > 0.01 {
-                    let opp = format!(
-                        "Spread: {:.2}% between {} and {}",
-                        spread * 100.0,
-                        pools_vec[i].pool_address,
-                        pools_vec[j].pool_address
-                    );
-                    opportunities.push(opp);
-                }
-            }
-        }
-
-        Ok(opportunities)
-    }
-
-    pub async fn cleanup_old_pools(&self, max_age_seconds: i64) -> Result<usize> {
-        let now = Utc::now().timestamp();
-        let mut pools = self.pools.write().await;
-        
-        let before = pools.len();
-        pools.retain(|_, pool| (now - pool.timestamp) <= max_age_seconds);
-        let removed = before - pools.len();
-
-        println!("🧹 Cleaned up {} old pools", removed);
-        Ok(removed)
-    }
-
-    pub async fn export_pool_state(&self, filename: &str) -> Result<()> {
-        use std::fs::File;
-        use std::io::Write;
-
-        let pools = self.pools.read().await;
-        let mut file = File::create(filename)?;
-
-        writeln!(file, "pool_address,token_a,token_b,reserve_a,reserve_b,price,liquidity,timestamp")?;
-
-        for pool in pools.values() {
-            writeln!(
-                file,
-                "{},{},{},{},{},{:.6},{:.2},{}",
-                pool.pool_address,
-                pool.token_a,
-                pool.token_b,
-                pool.reserve_a,
-                pool.reserve_b,
-                pool.price,
-                pool.liquidity,
-                pool.timestamp
-            )?;
-        }
-
-        println!("💾 Exported pool state to {}", filename);
-        Ok(())
-    }
-
     pub async fn print_summary(&self) -> Result<()> {
         let pools = self.pools.read().await;
         let total_liquidity: f64 = pools.values().map(|p| p.liquidity).sum();
 
-        println!("\n📊 Pool Subscription Summary");
-        println!("├─ Total Pools: {}", pools.len());
-        println!("├─ Total Liquidity: ${:.2}", total_liquidity);
-        println!("└─ Last Updated: {} UTC", Utc::now());
+        info!("Pool Subscription Summary: pools={}, total_liquidity={:.2}", pools.len(), total_liquidity);
 
         for (idx, pool) in pools.values().enumerate().take(5) {
-            println!("  {}. {} - Price: {:.6}, Liquidity: ${:.2}", 
-                idx + 1, pool.pool_address, pool.price, pool.liquidity);
+            info!(
+                "  {}. {} - Price: {:.6}, Liquidity: {:.2}",
+                idx + 1, pool.pool_address, pool.price, pool.liquidity
+            );
         }
 
         if pools.len() > 5 {
-            println!("  ... and {} more pools", pools.len() - 5);
+            info!("  ... and {} more pools", pools.len() - 5);
         }
 
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket subscriber
+// ---------------------------------------------------------------------------
+
+/// Subscribes to on-chain pool account changes over WebSocket and forwards
+/// raw account data through an mpsc channel so the caller can deserialize
+/// with the appropriate DEX-specific logic (reusing `PoolRefreshManager`).
+pub struct WebSocketPoolSubscriber {
+    ws_url: String,
+    /// Maps pool Pubkey -> (subscription_request_id, dex_name)
+    pool_subscriptions: Vec<(Pubkey, String)>,
+}
+
+impl WebSocketPoolSubscriber {
+    pub fn new(ws_url: String) -> Self {
+        Self {
+            ws_url,
+            pool_subscriptions: Vec::new(),
+        }
+    }
+
+    /// Register a pool address to subscribe to.
+    pub fn add_pool(&mut self, pool_address: Pubkey, dex_name: String) {
+        self.pool_subscriptions.push((pool_address, dex_name));
+    }
+
+    /// Register many pool addresses at once.
+    pub fn add_pools(&mut self, pools: Vec<(Pubkey, String)>) {
+        self.pool_subscriptions.extend(pools);
+    }
+
+    /// Number of registered pool subscriptions.
+    pub fn pool_count(&self) -> usize {
+        self.pool_subscriptions.len()
+    }
+}
+
+/// Start the WebSocket subscriber. Returns a receiver of `RawAccountUpdate`.
+///
+/// This spawns a long-lived tokio task that:
+/// 1. Connects to the Solana WebSocket RPC.
+/// 2. Sends `accountSubscribe` for every registered pool address.
+/// 3. Forwards decoded account data through the channel.
+/// 4. Reconnects with exponential backoff on disconnect.
+pub fn start_websocket_subscriber(
+    subscriber: WebSocketPoolSubscriber,
+) -> mpsc::UnboundedReceiver<RawAccountUpdate> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(ws_connection_loop(
+        subscriber.ws_url,
+        subscriber.pool_subscriptions,
+        tx,
+    ));
+
+    rx
+}
+
+async fn ws_connection_loop(
+    ws_url: String,
+    pool_subs: Vec<(Pubkey, String)>,
+    tx: mpsc::UnboundedSender<RawAccountUpdate>,
+) {
+    let mut backoff_ms: u64 = 500;
+    const MAX_BACKOFF_MS: u64 = 30_000;
+
+    loop {
+        info!("WebSocket: connecting to {} ({} pools)", ws_url, pool_subs.len());
+
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws_stream, _response)) => {
+                info!("WebSocket: connected");
+                backoff_ms = 500; // reset backoff on successful connect
+
+                let (mut write, mut read) = ws_stream.split();
+
+                // Maps JSON-RPC request id -> (pool_address, dex_name)
+                let mut request_id_map: HashMap<u64, (Pubkey, String)> = HashMap::new();
+                // Maps subscription_id (returned by server) -> (pool_address, dex_name)
+                let mut sub_id_map: HashMap<u64, (Pubkey, String)> = HashMap::new();
+
+                // Send accountSubscribe for each pool
+                for (idx, (pool_addr, dex_name)) in pool_subs.iter().enumerate() {
+                    let request_id = (idx + 1) as u64;
+                    let subscribe_msg = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "accountSubscribe",
+                        "params": [
+                            pool_addr.to_string(),
+                            {
+                                "encoding": "base64",
+                                "commitment": "confirmed"
+                            }
+                        ]
+                    });
+
+                    request_id_map.insert(request_id, (*pool_addr, dex_name.clone()));
+
+                    if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                        error!("WebSocket: failed to send subscribe for {}: {}", pool_addr, e);
+                        break;
+                    }
+                }
+
+                debug!("WebSocket: sent {} accountSubscribe requests", pool_subs.len());
+
+                // Read loop
+                let mut disconnected = false;
+                while let Some(msg_result) = read.next().await {
+                    match msg_result {
+                        Ok(Message::Text(text)) => {
+                            if let Err(e) = handle_ws_message(
+                                &text,
+                                &request_id_map,
+                                &mut sub_id_map,
+                                &tx,
+                            ) {
+                                debug!("WebSocket: message handling error: {}", e);
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Ok(Message::Close(_)) => {
+                            warn!("WebSocket: server sent close frame");
+                            disconnected = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("WebSocket: read error: {}", e);
+                            disconnected = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !disconnected {
+                    warn!("WebSocket: stream ended unexpectedly");
+                }
+            }
+            Err(e) => {
+                warn!("WebSocket: connection failed: {}", e);
+            }
+        }
+
+        // Exponential backoff before reconnect
+        warn!("WebSocket: reconnecting in {}ms", backoff_ms);
+        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+    }
+}
+
+/// Parse a single WebSocket text message.
+///
+/// There are two kinds of messages we expect:
+/// 1. Subscription confirmation: `{"jsonrpc":"2.0","result":<sub_id>,"id":<req_id>}`
+///    We use this to map the subscription id back to the pool address.
+/// 2. Account notification: `{"jsonrpc":"2.0","method":"accountNotification","params":{...}}`
+///    We decode the base64 account data and send it through the channel.
+fn handle_ws_message(
+    text: &str,
+    request_id_map: &HashMap<u64, (Pubkey, String)>,
+    sub_id_map: &mut HashMap<u64, (Pubkey, String)>,
+    tx: &mpsc::UnboundedSender<RawAccountUpdate>,
+) -> Result<()> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
+
+    // Case 1: subscription confirmation
+    if let (Some(id), Some(result)) = (v.get("id"), v.get("result")) {
+        if let (Some(req_id), Some(sub_id)) = (id.as_u64(), result.as_u64()) {
+            if let Some((pool_addr, dex_name)) = request_id_map.get(&req_id) {
+                sub_id_map.insert(sub_id, (*pool_addr, dex_name.clone()));
+                debug!("WebSocket: subscribed to {} (sub_id={})", pool_addr, sub_id);
+            }
+        }
+        return Ok(());
+    }
+
+    // Case 2: account notification
+    if v.get("method").and_then(|m| m.as_str()) == Some("accountNotification") {
+        let params = v.get("params").ok_or_else(|| anyhow!("missing params"))?;
+        let subscription = params.get("subscription")
+            .and_then(|s| s.as_u64())
+            .ok_or_else(|| anyhow!("missing subscription id"))?;
+
+        let (pool_addr, dex_name) = sub_id_map.get(&subscription)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown subscription id {}", subscription))?;
+
+        let result = params.get("result")
+            .ok_or_else(|| anyhow!("missing result"))?;
+
+        let slot = result.get("context")
+            .and_then(|c| c.get("slot"))
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
+
+        let account_data = result.get("value")
+            .and_then(|v| v.get("data"))
+            .ok_or_else(|| anyhow!("missing account data"))?;
+
+        // data is [base64_string, "base64"]
+        let base64_str = if let Some(arr) = account_data.as_array() {
+            arr.first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("data array missing base64 string"))?
+        } else if let Some(s) = account_data.as_str() {
+            s
+        } else {
+            return Err(anyhow!("unexpected data format"));
+        };
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(base64_str)
+            .map_err(|e| anyhow!("base64 decode failed: {}", e))?;
+
+        let update = RawAccountUpdate {
+            pool_address: pool_addr,
+            data: decoded,
+            slot,
+            dex_name,
+        };
+
+        let _ = tx.send(update);
+
+        return Ok(());
+    }
+
+    // Case 3: error response
+    if let Some(err) = v.get("error") {
+        warn!("WebSocket: RPC error: {}", err);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cache (preserved from original)
+// ---------------------------------------------------------------------------
 
 pub struct PoolStateCache {
     cache: Arc<RwLock<HashMap<Pubkey, CachedPoolState>>>,
@@ -236,7 +373,7 @@ impl PoolStateCache {
 
     pub async fn get(&self, pool: Pubkey) -> Option<PoolStateUpdate> {
         let cache = self.cache.read().await;
-        
+
         if let Some(cached) = cache.get(&pool) {
             let age = Utc::now().timestamp() - cached.cached_at;
             if age <= self.ttl_seconds as i64 {
@@ -263,7 +400,7 @@ impl PoolStateCache {
     pub async fn get_stats(&self) -> CacheStats {
         let cache = self.cache.read().await;
         let now = Utc::now().timestamp();
-        
+
         let valid_entries = cache.values()
             .filter(|e| (now - e.cached_at) <= self.ttl_seconds as i64)
             .count();
@@ -285,6 +422,10 @@ pub struct CacheStats {
     pub ttl_seconds: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache() {
         let cache = PoolStateCache::new(60);
-        
+
         let update = PoolStateUpdate {
             pool_address: Pubkey::default(),
             token_a: Pubkey::default(),
@@ -308,5 +449,96 @@ mod tests {
         cache.set(update.clone()).await;
         let retrieved = cache.get(update.pool_address).await;
         assert!(retrieved.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_manager_update() {
+        let mgr = PoolSubscriptionManager::new();
+
+        let update = PoolStateUpdate {
+            pool_address: Pubkey::new_unique(),
+            token_a: Pubkey::default(),
+            token_b: Pubkey::default(),
+            reserve_a: 500,
+            reserve_b: 1000,
+            price: 0.5,
+            liquidity: 1500.0,
+            timestamp: Utc::now().timestamp(),
+            slot: 42,
+        };
+
+        mgr.update_pool_state(update.clone()).await.unwrap();
+        let retrieved = mgr.get_pool_state(update.pool_address).await.unwrap();
+        assert_eq!(retrieved.slot, 42);
+    }
+
+    #[test]
+    fn test_websocket_subscriber_construction() {
+        let mut sub = WebSocketPoolSubscriber::new("wss://example.com".to_string());
+        sub.add_pool(Pubkey::new_unique(), "Raydium".to_string());
+        sub.add_pools(vec![
+            (Pubkey::new_unique(), "Pump".to_string()),
+            (Pubkey::new_unique(), "DLMM".to_string()),
+        ]);
+        assert_eq!(sub.pool_subscriptions.len(), 3);
+    }
+
+    #[test]
+    fn test_handle_subscription_confirmation() {
+        let pool = Pubkey::new_unique();
+        let mut request_map = HashMap::new();
+        request_map.insert(1u64, (pool, "Raydium".to_string()));
+        let mut sub_map = HashMap::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": 12345,
+            "id": 1
+        });
+
+        handle_ws_message(&msg.to_string(), &request_map, &mut sub_map, &tx).unwrap();
+        assert!(sub_map.contains_key(&12345));
+        assert_eq!(sub_map[&12345].0, pool);
+    }
+
+    #[test]
+    fn test_handle_account_notification() {
+        let pool = Pubkey::new_unique();
+        let mut request_map = HashMap::new();
+        let mut sub_map = HashMap::new();
+        sub_map.insert(99u64, (pool, "Pump".to_string()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Encode 100 bytes of zeros as base64
+        use base64::Engine;
+        let data_bytes = vec![0u8; 100];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data_bytes);
+
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "accountNotification",
+            "params": {
+                "subscription": 99,
+                "result": {
+                    "context": { "slot": 12345 },
+                    "value": {
+                        "data": [b64, "base64"],
+                        "executable": false,
+                        "lamports": 1000000,
+                        "owner": "11111111111111111111111111111111",
+                        "rentEpoch": 0
+                    }
+                }
+            }
+        });
+
+        handle_ws_message(&msg.to_string(), &request_map, &mut sub_map, &tx).unwrap();
+
+        let update = rx.try_recv().unwrap();
+        assert_eq!(update.pool_address, pool);
+        assert_eq!(update.slot, 12345);
+        assert_eq!(update.dex_name, "Pump");
+        assert_eq!(update.data.len(), 100);
     }
 }

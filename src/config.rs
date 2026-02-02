@@ -18,6 +18,9 @@ pub struct BotConfig {
     pub spam_enabled: bool,
     pub spam_rpc_urls: Vec<String>,
     pub flashloan_enabled: bool,
+    pub flashloan_reserve: String,
+    pub flashloan_reserve_vault: String,
+    pub flashloan_fee_receiver: String,
     pub enable_real_execution: bool,
     pub refresh_interval_ms: u64,
     pub loop_interval_ms: u64,
@@ -104,6 +107,10 @@ impl BotConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(false);
 
+        let flashloan_reserve = std::env::var("FLASHLOAN_RESERVE").unwrap_or_default();
+        let flashloan_reserve_vault = std::env::var("FLASHLOAN_RESERVE_VAULT").unwrap_or_default();
+        let flashloan_fee_receiver = std::env::var("FLASHLOAN_FEE_RECEIVER").unwrap_or_default();
+
         let enable_real_execution = std::env::var("ENABLE_REAL_EXECUTION")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -135,6 +142,9 @@ impl BotConfig {
             spam_enabled,
             spam_rpc_urls,
             flashloan_enabled,
+            flashloan_reserve,
+            flashloan_reserve_vault,
+            flashloan_fee_receiver,
             enable_real_execution,
             refresh_interval_ms,
             loop_interval_ms,
