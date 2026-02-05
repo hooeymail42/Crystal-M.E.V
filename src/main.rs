@@ -23,6 +23,7 @@ use crate::chain::trade_logger::{TradeLogger, ExecutedTrade};
 use crate::chain::gas_fee::GasFeeConfig;
 use crate::chain::volume_weighted_slippage::VolumeWeightedSlippagePredictor;
 use crate::chain::pool_subscription::{WebSocketPoolSubscriber, RawAccountUpdate, start_websocket_subscriber};
+use crate::chain::capital_manager::CapitalManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -79,6 +80,18 @@ async fn main() -> Result<()> {
     if config.jito_enabled {
         info!("Jito MEV bundles enabled: tip={} lamports, engine={}",
             config.jito_tip_lamports, config.jito_block_engine_url);
+    }
+
+    // Initialize capital manager for auto-compounding and dynamic position sizing
+    let mut capital_manager = CapitalManager::new(
+        rpc.clone(),
+        wallet_address,
+    ).with_risk_params(0.10, 0.05, true); // 10% risk per trade, 0.05 SOL reserve, auto-compound on
+
+    if let Err(e) = capital_manager.initialize() {
+        warn!("CapitalManager init failed (will retry): {}", e);
+    } else {
+        capital_manager.print_summary();
     }
 
     let mut refresh_manager = PoolRefreshManager::new(rpc.clone());
@@ -187,6 +200,42 @@ async fn main() -> Result<()> {
             }
         }
 
+        for pool_addr in &mint_config.phoenix_pools {
+            if let Err(e) = mpd.add_phoenix_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Phoenix pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.lifinity_pools {
+            if let Err(e) = mpd.add_lifinity_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Lifinity pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.heaven_pools {
+            if let Err(e) = mpd.add_heaven_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Heaven pool {}: {}", pool_addr, e);
+            }
+        }
+
         info!("Loaded {} pools for mint {}", mpd.pools.len(), mint_config.mint);
         mint_pool_datas.push(mpd);
     }
@@ -284,6 +333,14 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Drawdown protection: pause if down >20% from high-water mark
+        if capital_manager.should_pause_trading(20.0) {
+            if loop_count % 50 == 0 {
+                warn!("[Drawdown Protection] Paused: {:.1}% drawdown from peak", capital_manager.drawdown_percent());
+            }
+            continue;
+        }
+
         // Periodic balance monitoring (every 50 loops)
         if loop_count % 50 == 0 {
             match rpc.get_balance(&wallet_address) {
@@ -336,7 +393,7 @@ async fn main() -> Result<()> {
         // Detect opportunities
         for mpd in &mint_pool_datas {
             let mut detector = OpportunityDetector::new(opp_config.clone(), &rpc);
-            let opportunities = detector.find_opportunities(mpd);
+            let opportunities = detector.find_opportunities(mpd, &refresh_manager);
 
             if !opportunities.is_empty() {
                 total_opportunities += opportunities.len() as u64;
@@ -367,6 +424,17 @@ async fn main() -> Result<()> {
                         est_gas_cost += config.jito_tip_lamports as f64 / 1e9;
                     }
                     let net_profit = best.gross_profit_sol - est_gas_cost;
+
+                    // Dynamic position sizing via capital manager
+                    let sized_input = capital_manager.size_position(
+                        (best.input_amount_sol * 1e9) as u64,
+                        best.confidence_score,
+                    );
+                    if sized_input == 0 {
+                        warn!("Insufficient capital for trade, skipping");
+                        continue;
+                    }
+                    let sized_input_sol = sized_input as f64 / 1e9;
 
                     // Use gas fee config's should_execute check
                     if gas_fee_config.should_execute(net_profit, num_hops) {
@@ -416,8 +484,15 @@ async fn main() -> Result<()> {
                                             let fl_reserve = Pubkey::from_str(&config.flashloan_reserve).unwrap();
                                             let fl_vault = Pubkey::from_str(&config.flashloan_reserve_vault).unwrap();
                                             let fl_fee = Pubkey::from_str(&config.flashloan_fee_receiver).unwrap();
-                                            let borrow_lamports = (best.input_amount_sol * 1e9) as u64;
-                                            info!("Using Kamino flash loan: borrow={:.4} SOL", best.input_amount_sol);
+                                            // Optimize flash loan borrow amount
+                                            let (borrow_lamports, _est_fl_profit) = tx_builder
+                                                .calculate_optimal_flashloan(
+                                                    sized_input_sol,
+                                                    best.profit_percent,
+                                                    capital_manager.available_capital_lamports(),
+                                                )
+                                                .unwrap_or(((sized_input_sol * 1e9) as u64, 0));
+                                            info!("Using Kamino flash loan: borrow={:.4} SOL (optimized)", borrow_lamports as f64 / 1e9);
                                             tx_builder.build_flashloan_transaction(
                                                 swap_ixs, borrow_lamports, &fl_reserve, &fl_vault, &fl_fee, blockhash,
                                             )
@@ -443,6 +518,11 @@ async fn main() -> Result<()> {
                                                             Ok(sig) => {
                                                                 total_executions += 1;
                                                                 consecutive_failures = 0;
+                                                                capital_manager.record_trade(
+                                                                    (best.input_amount_sol * 1e9) as u64,
+                                                                    (best.expected_output_sol * 1e9) as u64,
+                                                                    true,
+                                                                );
                                                                 info!("TX confirmed: {} (total executions: {})", sig, total_executions);
 
                                                                 let trade = ExecutedTrade {
@@ -464,6 +544,11 @@ async fn main() -> Result<()> {
                                                             }
                                                             Err(e) => {
                                                                 consecutive_failures += 1;
+                                                                capital_manager.record_trade(
+                                                                    (best.input_amount_sol * 1e9) as u64,
+                                                                    0,
+                                                                    false,
+                                                                );
                                                                 warn!("TX send failed (consecutive_failures={}): {}", consecutive_failures, e);
                                                                 if consecutive_failures >= 50 {
                                                                     error!("Circuit breaker: 50 consecutive failures, shutting down");
@@ -544,6 +629,12 @@ async fn main() -> Result<()> {
             if let Err(e) = trade_logger.print_summary() {
                 warn!("Failed to print trade summary: {}", e);
             }
+            // Refresh balance, adapt risk, print capital summary
+            if let Err(e) = capital_manager.refresh_balance() {
+                warn!("Failed to refresh capital balance: {}", e);
+            }
+            capital_manager.adapt_risk();
+            capital_manager.print_summary();
         }
     }
 }

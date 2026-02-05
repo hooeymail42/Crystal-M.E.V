@@ -40,6 +40,9 @@ pub struct MintConfig {
     pub solfi_pools: Vec<String>,
     pub meteora_damm_v2_pools: Vec<String>,
     pub vertigo_pools: Vec<String>,
+    pub phoenix_pools: Vec<String>,
+    pub lifinity_pools: Vec<String>,
+    pub heaven_pools: Vec<String>,
 }
 
 impl BotConfig {
@@ -182,6 +185,9 @@ impl BotConfig {
                     solfi_pools: parse_pool_list("SOLFI_POOL_LIST"),
                     meteora_damm_v2_pools: parse_pool_list("METEORA_DAMM_V2_POOL_LIST"),
                     vertigo_pools: parse_pool_list("VERTIGO_POOL_LIST"),
+                    phoenix_pools: parse_pool_list("PHOENIX_POOL_LIST"),
+                    lifinity_pools: parse_pool_list("LIFINITY_POOL_LIST"),
+                    heaven_pools: parse_pool_list("HEAVEN_POOL_LIST"),
                 });
             }
         }

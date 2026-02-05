@@ -1,4 +1,5 @@
 pub mod advanced_mev_detection;
+pub mod capital_manager;
 pub mod constants;
 pub mod gas_fee;
 pub mod opportunity_detector;

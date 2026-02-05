@@ -1,4 +1,7 @@
+pub mod heaven;
+pub mod lifinity;
 pub mod meteora;
+pub mod phoenix;
 pub mod pump;
 pub mod raydium;
 pub mod solfi;
@@ -11,4 +14,7 @@ pub enum Dex {
     Pump,
     Dlmm,
     Whirlpool,
+    Phoenix,
+    Lifinity,
+    Heaven,
 }

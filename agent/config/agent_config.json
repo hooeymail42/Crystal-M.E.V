@@ -1,0 +1,18 @@
+{
+  "monitoring": {
+    "check_interval_seconds": 30,
+    "max_downtime_minutes": 5,
+    "profit_threshold_alert": 0.1
+  },
+  "trading": {
+    "max_daily_loss_sol": 0.5,
+    "min_profit_threshold_sol": 0.01,
+    "auto_restart_on_crash": true
+  },
+  "notifications": {
+    "enabled": true,
+    "webhook_url": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": ""
+  }
+}

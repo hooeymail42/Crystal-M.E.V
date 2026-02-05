@@ -1,5 +1,6 @@
 use crate::chain::{
     pools::{MintPoolData, Pool, PoolData},
+    refresh::{DeserializedPoolState, PoolRefreshManager},
     trading_graph::TradingGraph,
 };
 use solana_client::rpc_client::RpcClient;
@@ -46,7 +47,7 @@ impl Default for OpportunityConfig {
     fn default() -> Self {
         Self {
             min_profit_percent: 0.3,
-            min_liquidity_sol: 10.0,
+            min_liquidity_sol: 1.0,
             max_slippage_percent: 1.0,
             max_volatility_percent: 10.0,
         }
@@ -63,72 +64,315 @@ impl<'a> OpportunityDetector<'a> {
         Self { config, rpc_client }
     }
 
-    fn get_pool_reserves(&self, pool: &dyn PoolData) -> anyhow::Result<(u64, u64)> {
-        let token_vault_balance = self.rpc_client.get_token_account_balance(pool.token_vault())?;
-        let sol_vault_balance = self.rpc_client.get_token_account_balance(pool.sol_vault())?;
-
-        Ok((
-            token_vault_balance.ui_amount.unwrap_or(0.0) as u64,
-            sol_vault_balance.ui_amount.unwrap_or(0.0) as u64,
-        ))
-    }
-
+    /// Main entry point: find profitable arbitrage opportunities using cached pool state.
     pub fn find_opportunities(
         &mut self,
         pool_data: &MintPoolData,
+        refresh_manager: &PoolRefreshManager,
     ) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
-        let graph = self.build_trading_graph(pool_data);
 
-        // Find 2-DEX opportunities
-        opportunities.extend(self.find_two_dex_opportunities(pool_data));
-        
-        // Find multi-hop opportunities
-        opportunities.extend(self.find_multi_hop_opportunities(pool_data));
+        opportunities.extend(self.find_two_dex_opportunities(pool_data, refresh_manager));
+        opportunities.extend(self.find_multi_hop_opportunities(pool_data, refresh_manager));
 
-        // Sort by profit (highest first)
+        // Sort by absolute profit descending
         opportunities.sort_by(|a, b| {
-            b.profit_percent
-                .partial_cmp(&a.profit_percent)
+            b.gross_profit_sol
+                .partial_cmp(&a.gross_profit_sol)
                 .unwrap_or(Ordering::Equal)
         });
 
-        // Filter and return
         opportunities.retain(|opp| opp.profit_percent > self.config.min_profit_percent);
         opportunities
     }
 
-    fn build_trading_graph(&self, pool_data: &MintPoolData) -> TradingGraph {
-        let mut graph = TradingGraph::new();
-        for pool in &pool_data.pools {
-            graph.add_pool(pool);
+    /// Get cached reserves for a pool.
+    fn get_cached_reserves(
+        &self,
+        pool: &Pool,
+        refresh_manager: &PoolRefreshManager,
+    ) -> Option<(u64, u64)> {
+        let reserves = refresh_manager.get_reserves(pool.pool_address())?;
+        if reserves.token_reserve == 0 || reserves.sol_reserve == 0 {
+            return None;
         }
-        graph
+        Some((reserves.token_reserve, reserves.sol_reserve))
     }
 
-    fn get_pool_price<'b>(&self, pool: &'b Pool) -> anyhow::Result<(f64, &'b str)> {
-        let (token_reserves, sol_reserves) = self.get_pool_reserves(pool)?;
-        if sol_reserves == 0 { return Err(anyhow::anyhow!("SOL reserves are zero")); }
-        Ok((token_reserves as f64 / sol_reserves as f64, pool.get_dex_name()))
+    /// Calculate buy output (SOL -> Token) using DEX-specific math from deserialized state,
+    /// falling back to constant-product with fee.
+    fn calculate_buy_quote(
+        &self,
+        pool: &Pool,
+        sol_amount_in: u64,
+        refresh_manager: &PoolRefreshManager,
+    ) -> Option<u64> {
+        let state = refresh_manager.get_pool_state(pool.pool_address());
+
+        match state {
+            Some(DeserializedPoolState::Pump {
+                virtual_sol_reserves, virtual_token_reserves, complete, ..
+            }) => {
+                if *complete || *virtual_sol_reserves == 0 || *virtual_token_reserves == 0 {
+                    return None;
+                }
+                let fee = sol_amount_in / 100;
+                let sol_after_fee = sol_amount_in.saturating_sub(fee);
+                let new_sol = *virtual_sol_reserves as u128 + sol_after_fee as u128;
+                let new_token = (*virtual_sol_reserves as u128)
+                    * (*virtual_token_reserves as u128)
+                    / new_sol;
+                let out = (*virtual_token_reserves as u128).saturating_sub(new_token);
+                Some(out as u64)
+            }
+            Some(DeserializedPoolState::Heaven {
+                virtual_sol_reserves, virtual_token_reserves, complete, ..
+            }) => {
+                if *complete || *virtual_sol_reserves == 0 || *virtual_token_reserves == 0 {
+                    return None;
+                }
+                let fee = sol_amount_in / 100;
+                let sol_after_fee = sol_amount_in.saturating_sub(fee);
+                let new_sol = *virtual_sol_reserves as u128 + sol_after_fee as u128;
+                let new_token = (*virtual_sol_reserves as u128)
+                    * (*virtual_token_reserves as u128)
+                    / new_sol;
+                let out = (*virtual_token_reserves as u128).saturating_sub(new_token);
+                Some(out as u64)
+            }
+            _ => {
+                // Generic constant-product with fee
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                let fee_bps = self.get_dex_fee_bps(pool.get_dex_name());
+                let sol_after_fee =
+                    sol_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_sol = sol_reserve as u128 + sol_after_fee;
+                if new_sol == 0 {
+                    return None;
+                }
+                let new_token =
+                    (sol_reserve as u128) * (token_reserve as u128) / new_sol;
+                let out = (token_reserve as u128).saturating_sub(new_token);
+                Some(out as u64)
+            }
+        }
+    }
+
+    /// Calculate sell output (Token -> SOL) using DEX-specific math.
+    fn calculate_sell_quote(
+        &self,
+        pool: &Pool,
+        token_amount_in: u64,
+        refresh_manager: &PoolRefreshManager,
+    ) -> Option<u64> {
+        let state = refresh_manager.get_pool_state(pool.pool_address());
+
+        match state {
+            Some(DeserializedPoolState::Pump {
+                virtual_sol_reserves, virtual_token_reserves, complete, ..
+            }) => {
+                if *complete || *virtual_sol_reserves == 0 || *virtual_token_reserves == 0 {
+                    return None;
+                }
+                let new_token = *virtual_token_reserves as u128 + token_amount_in as u128;
+                let new_sol = (*virtual_sol_reserves as u128)
+                    * (*virtual_token_reserves as u128)
+                    / new_token;
+                let sol_out = (*virtual_sol_reserves as u128).saturating_sub(new_sol);
+                let fee = sol_out / 100;
+                Some(sol_out.saturating_sub(fee) as u64)
+            }
+            Some(DeserializedPoolState::Heaven {
+                virtual_sol_reserves, virtual_token_reserves, complete, ..
+            }) => {
+                if *complete || *virtual_sol_reserves == 0 || *virtual_token_reserves == 0 {
+                    return None;
+                }
+                let new_token = *virtual_token_reserves as u128 + token_amount_in as u128;
+                let new_sol = (*virtual_sol_reserves as u128)
+                    * (*virtual_token_reserves as u128)
+                    / new_token;
+                let sol_out = (*virtual_sol_reserves as u128).saturating_sub(new_sol);
+                let fee = sol_out / 100;
+                Some(sol_out.saturating_sub(fee) as u64)
+            }
+            _ => {
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                let fee_bps = self.get_dex_fee_bps(pool.get_dex_name());
+                let token_after_fee =
+                    token_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_token = token_reserve as u128 + token_after_fee;
+                if new_token == 0 {
+                    return None;
+                }
+                let new_sol =
+                    (token_reserve as u128) * (sol_reserve as u128) / new_token;
+                let out = (sol_reserve as u128).saturating_sub(new_sol);
+                Some(out as u64)
+            }
+        }
+    }
+
+    /// Fee in basis points per DEX
+    fn get_dex_fee_bps(&self, dex_name: &str) -> u64 {
+        match dex_name {
+            "Raydium" | "RaydiumCp" | "MeteoraDAmm" | "MeteoraDAmmV2" => 25,
+            "RaydiumClmm" => 25,
+            "Pump" | "Heaven" => 100,
+            "DLMM" | "Whirlpool" | "Solfi" | "Vertigo" | "Lifinity" => 30,
+            "Phoenix" => 10,
+            _ => 30,
+        }
+    }
+
+    /// Optimal input: 2% of the smaller pool's SOL reserve, clamped.
+    fn optimal_input_lamports(
+        &self,
+        pool1: &Pool,
+        pool2: &Pool,
+        refresh_manager: &PoolRefreshManager,
+    ) -> Option<u64> {
+        let (_, sol1) = self.get_cached_reserves(pool1, refresh_manager)?;
+        let (_, sol2) = self.get_cached_reserves(pool2, refresh_manager)?;
+
+        let smaller = sol1.min(sol2);
+        let min_liq = (self.config.min_liquidity_sol * 1e9) as u64;
+        if smaller < min_liq {
+            return None;
+        }
+
+        let target = smaller / 50; // 2%
+        let min_trade = 10_000_000u64; // 0.01 SOL
+        Some(target.max(min_trade))
+    }
+
+    /// Confidence score (0-100) based on pool characteristics.
+    fn compute_confidence(
+        &self,
+        pool1: &Pool,
+        pool2: &Pool,
+        refresh_manager: &PoolRefreshManager,
+    ) -> u8 {
+        let mut score: f64 = 50.0;
+
+        if let (Some((_, sol1)), Some((_, sol2))) = (
+            self.get_cached_reserves(pool1, refresh_manager),
+            self.get_cached_reserves(pool2, refresh_manager),
+        ) {
+            let min_sol = sol1.min(sol2) as f64 / 1e9;
+            if min_sol > 100.0 {
+                score += 30.0;
+            } else if min_sol > 10.0 {
+                score += 20.0;
+            } else if min_sol > 1.0 {
+                score += 5.0;
+            } else {
+                score -= 10.0;
+            }
+        }
+
+        for dex in [pool1.get_dex_name(), pool2.get_dex_name()] {
+            match dex {
+                "Raydium" | "DLMM" | "Whirlpool" | "Phoenix" => score += 5.0,
+                "Pump" | "Heaven" => score -= 5.0,
+                _ => {}
+            }
+        }
+
+        score.clamp(0.0, 100.0) as u8
     }
 
     fn find_two_dex_opportunities(
         &self,
         pool_data: &MintPoolData,
+        refresh_manager: &PoolRefreshManager,
     ) -> Vec<ArbitrageOpportunity> {
         let mut opps = Vec::new();
         let pools = &pool_data.pools;
+        let token_mint = pool_data.mint.to_string();
 
-        for (i, pool1) in pools.iter().enumerate() {
-            for (j, pool2) in pools.iter().enumerate() {
-                if i == j { continue; }
-
-                if let (Ok((price1, dex1)), Ok((price2, dex2))) = (self.get_pool_price(pool1), self.get_pool_price(pool2)) {
-                    let profit = price2 - price1;
-                    if profit > 0.0 {
-                        opps.push(self.create_opp(dex1, dex2, profit));
-                    }
+        for (i, buy_pool) in pools.iter().enumerate() {
+            for (j, sell_pool) in pools.iter().enumerate() {
+                if i == j {
+                    continue;
                 }
+
+                let input_lamports = match self.optimal_input_lamports(
+                    buy_pool, sell_pool, refresh_manager,
+                ) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let tokens_received = match self.calculate_buy_quote(
+                    buy_pool, input_lamports, refresh_manager,
+                ) {
+                    Some(v) if v > 0 => v,
+                    _ => continue,
+                };
+
+                let sol_output = match self.calculate_sell_quote(
+                    sell_pool, tokens_received, refresh_manager,
+                ) {
+                    Some(v) if v > 0 => v,
+                    _ => continue,
+                };
+
+                if sol_output <= input_lamports {
+                    continue;
+                }
+
+                let profit_lamports = sol_output - input_lamports;
+                let input_sol = input_lamports as f64 / 1e9;
+                let output_sol = sol_output as f64 / 1e9;
+                let profit_sol = profit_lamports as f64 / 1e9;
+                let profit_pct = (profit_sol / input_sol) * 100.0;
+
+                if profit_pct < self.config.min_profit_percent {
+                    continue;
+                }
+
+                let confidence =
+                    self.compute_confidence(buy_pool, sell_pool, refresh_manager);
+
+                opps.push(ArbitrageOpportunity {
+                    token_mint: token_mint.clone(),
+                    path: vec![
+                        PathStep {
+                            dex: buy_pool.get_dex_name().to_string(),
+                            pool_address: buy_pool.pool_address().to_string(),
+                            action: "buy".to_string(),
+                            price: tokens_received as f64 / input_lamports as f64,
+                            token_in: pool_data.wallet_wsol_account.to_string(),
+                            token_out: token_mint.clone(),
+                            amount_in: input_lamports as f64,
+                            amount_out: tokens_received as f64,
+                        },
+                        PathStep {
+                            dex: sell_pool.get_dex_name().to_string(),
+                            pool_address: sell_pool.pool_address().to_string(),
+                            action: "sell".to_string(),
+                            price: sol_output as f64 / tokens_received as f64,
+                            token_in: token_mint.clone(),
+                            token_out: pool_data.wallet_wsol_account.to_string(),
+                            amount_in: tokens_received as f64,
+                            amount_out: sol_output as f64,
+                        },
+                    ],
+                    gross_profit_sol: profit_sol,
+                    profit_percent: profit_pct,
+                    input_amount_sol: input_sol,
+                    expected_output_sol: output_sol,
+                    pool_addresses: vec![
+                        buy_pool.pool_address().to_string(),
+                        sell_pool.pool_address().to_string(),
+                    ],
+                    risk_score: (100 - confidence).min(100),
+                    confidence_score: confidence,
+                    estimated_execution_ms: 100,
+                });
             }
         }
 
@@ -138,205 +382,107 @@ impl<'a> OpportunityDetector<'a> {
     fn find_multi_hop_opportunities(
         &self,
         pool_data: &MintPoolData,
+        refresh_manager: &PoolRefreshManager,
     ) -> Vec<ArbitrageOpportunity> {
         let mut opps = Vec::new();
-        let graph = self.build_trading_graph(pool_data);
+        let mut graph = TradingGraph::new();
+        for pool in &pool_data.pools {
+            graph.add_pool(pool);
+        }
 
         for start_node in &graph.nodes {
-            let cycles = graph.find_cycles(*start_node, 3); // Find 3-hop cycles
-            
+            let cycles = graph.find_cycles(*start_node, 3);
+
             for cycle in cycles {
-                if cycle.len() != 3 { continue; } // Ensure it's a 3-hop cycle
+                if cycle.len() != 3 {
+                    continue;
+                }
 
-                let mut path_steps: Vec<PathStep> = Vec::new();
-                let mut current_amount = 1.0; // Starting with 1 SOL for simplicity
-                let mut current_token_in_pubkey = *start_node;
-                let mut all_pool_addresses: Vec<String> = Vec::new();
+                let first_pool = &cycle[0].2;
+                let (_, first_sol) = match self.get_cached_reserves(first_pool, refresh_manager) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
-                let mut profitable_cycle = true;
+                let input_lamports = (first_sol / 100).max(10_000_000);
 
-                for (step_from_token, step_to_token, pool) in cycle {
-                    if step_from_token != current_token_in_pubkey {
-                        profitable_cycle = false;
+                let mut current_amount = input_lamports;
+                let mut current_token_in = *start_node;
+                let mut path_steps = Vec::new();
+                let mut all_pool_addresses = Vec::new();
+                let mut valid = true;
+
+                for (from_token, to_token, pool) in &cycle {
+                    if *from_token != current_token_in {
+                        valid = false;
                         break;
                     }
-                    
-                    let (token_reserves, sol_reserves) = match self.get_pool_reserves(&pool) {
-                        Ok(res) => res,
-                        Err(_) => {
-                            profitable_cycle = false;
-                            break;
+
+                    let (action, amount_out) = if pool.base_mint() == from_token {
+                        match self.calculate_buy_quote(pool, current_amount, refresh_manager) {
+                            Some(out) if out > 0 => ("buy".to_string(), out),
+                            _ => {
+                                valid = false;
+                                break;
+                            }
                         }
-                    };
-
-                    if sol_reserves == 0 || token_reserves == 0 {
-                        profitable_cycle = false;
-                        break;
-                    }
-
-                    let price: f64;
-                    let action: String;
-                    let token_in_str: String;
-                    let token_out_str: String;
-
-                    if pool.token_mint() == &step_from_token { // Trading from Token (token_mint) to SOL (base_mint)
-                        price = token_reserves as f64 / sol_reserves as f64;
-                        action = "sell".to_string();
-                        token_in_str = pool.token_mint().to_string();
-                        token_out_str = pool.base_mint().to_string();
-                    } else if pool.base_mint() == &step_from_token { // Trading from SOL (base_mint) to Token (token_mint)
-                        price = sol_reserves as f64 / token_reserves as f64;
-                        action = "buy".to_string();
-                        token_in_str = pool.base_mint().to_string();
-                        token_out_str = pool.token_mint().to_string();
+                    } else if pool.token_mint() == from_token {
+                        match self.calculate_sell_quote(pool, current_amount, refresh_manager) {
+                            Some(out) if out > 0 => ("sell".to_string(), out),
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
                     } else {
-                        profitable_cycle = false;
+                        valid = false;
                         break;
-                    }
-
-                    let amount_out = current_amount * price; // Simplified, actual calculation needs to consider slippage etc.
+                    };
 
                     path_steps.push(PathStep {
                         dex: pool.get_dex_name().to_string(),
                         pool_address: pool.pool_address().to_string(),
-                        action: action,
-                        price: price,
-                        token_in: token_in_str,
-                        token_out: token_out_str,
-                        amount_in: current_amount,
-                        amount_out: amount_out,
+                        action,
+                        price: amount_out as f64 / current_amount as f64,
+                        token_in: from_token.to_string(),
+                        token_out: to_token.to_string(),
+                        amount_in: current_amount as f64,
+                        amount_out: amount_out as f64,
                     });
                     all_pool_addresses.push(pool.pool_address().to_string());
                     current_amount = amount_out;
-                    current_token_in_pubkey = step_to_token;
+                    current_token_in = *to_token;
                 }
 
-                if profitable_cycle && path_steps.len() == 3 {
-                    // Assuming the cycle ends with the initial token (e.g., SOL)
-                    let profit = current_amount - 1.0; // Compare final amount with initial 1 SOL
-                    if profit > self.config.min_profit_percent { // Check against min_profit_percent, not just > 0.0
-                        opps.push(ArbitrageOpportunity {
-                            token_mint: start_node.to_string(), // Starting token of the cycle
-                            path: path_steps,
-                            gross_profit_sol: profit,
-                            profit_percent: profit * 100.0,
-                            input_amount_sol: 1.0,
-                            expected_output_sol: current_amount,
-                            pool_addresses: all_pool_addresses,
-                            risk_score: 50, // Placeholder
-                            confidence_score: 80, // Placeholder
-                            estimated_execution_ms: 150, // Placeholder
-                        });
-                    }
+                if !valid || path_steps.len() != 3 || current_amount <= input_lamports {
+                    continue;
                 }
+
+                let profit_lamports = current_amount - input_lamports;
+                let input_sol = input_lamports as f64 / 1e9;
+                let output_sol = current_amount as f64 / 1e9;
+                let profit_sol = profit_lamports as f64 / 1e9;
+                let profit_pct = (profit_sol / input_sol) * 100.0;
+
+                if profit_pct < self.config.min_profit_percent {
+                    continue;
+                }
+
+                opps.push(ArbitrageOpportunity {
+                    token_mint: start_node.to_string(),
+                    path: path_steps,
+                    gross_profit_sol: profit_sol,
+                    profit_percent: profit_pct,
+                    input_amount_sol: input_sol,
+                    expected_output_sol: output_sol,
+                    pool_addresses: all_pool_addresses,
+                    risk_score: 60,
+                    confidence_score: 70,
+                    estimated_execution_ms: 200,
+                });
             }
         }
 
         opps
     }
-
-    fn create_opp(&self, dex1: &str, dex2: &str, profit: f64) -> ArbitrageOpportunity {
-        let profit_pct = profit * 100.0;
-        
-        ArbitrageOpportunity {
-            token_mint: "test".to_string(),
-            path: vec![
-                PathStep {
-                    dex: dex1.to_string(),
-                    pool_address: "pool1".to_string(),
-                    action: "buy".to_string(),
-                    price: 1.0,
-                    token_in: "SOL".to_string(),
-                    token_out: "TOKEN".to_string(),
-                    amount_in: 1.0,
-                    amount_out: 1.0,
-                },
-                PathStep {
-                    dex: dex2.to_string(),
-                    pool_address: "pool2".to_string(),
-                    action: "sell".to_string(),
-                    price: 1.0 + profit,
-                    token_in: "TOKEN".to_string(),
-                    token_out: "SOL".to_string(),
-                    amount_in: 1.0,
-                    amount_out: 1.0 + profit,
-                },
-            ],
-            gross_profit_sol: profit,
-            profit_percent: profit_pct,
-            input_amount_sol: 1.0,
-            expected_output_sol: 1.0 + profit,
-            pool_addresses: vec!["pool1".to_string(), "pool2".to_string()],
-            risk_score: 45,
-            confidence_score: 85,
-            estimated_execution_ms: 100,
-        }
-    }
 }
-
-/*
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chain::pools::{PumpPool, RaydiumPool}; // Keep these imports for now, even if not directly used in new structure
-    use solana_client::rpc_client::RpcClient;
-    use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
-
-    #[test]
-    fn test_find_opportunities() {
-        let rpc_client = RpcClient::new_mock("succeeds");
-
-        let mut config = OpportunityConfig::default();
-        config.min_profit_percent = 0.0; // Set min profit to 0 for testing purposes
-        let mut detector = OpportunityDetector::new(config, &rpc_client);
-
-        let mut pool_data = MintPoolData::default();
-        let token_mint_sol = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let token_mint_usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-        let token_mint_usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2cpdgBnGsmvPXsCjQQxW7GgqA").unwrap();
-
-        // Add a Raydium Pool (SOL-USDC)
-        pool_data.add_raydium_pool(
-            "J2F2sL4K4H8G5J8K3L2M1N0O6Q7P3L7F4H8G5J8K3", // Valid dummy pool address
-            "AK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy token_vault
-            "BK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy sol_vault
-            &token_mint_usdc.to_string(),
-            &token_mint_sol.to_string(),
-        ).unwrap();
-
-        // Add a Pump Pool (SOL-USDC, for demonstration, assuming it functions like Raydium for reserves)
-        pool_data.add_pump_pool(
-            "C2F2sL4K4H8G5J8K3L2M1N0O6Q7P3L7F4H8G5J8K3", // Valid dummy pool address
-            "DK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy token_vault
-            "EK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy sol_vault
-            "fee_wallet",
-            "creator_ata",
-            "creator_authority",
-            &token_mint_usdc.to_string(),
-            &token_mint_sol.to_string(),
-        ).unwrap();
-
-        // Add a DLMM Pool (USDC-USDT)
-        pool_data.add_dlmm_pool(
-            "F2F2sL4K4H8G5J8K3L2M1N0O6Q7P3L7F4H8G5J8K3", // Valid dummy pool address
-            "GK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy token_vault (USDC)
-            "HK4R2M1N0O6Q7P3L7F4H8G5J8K3L2M1N0O6Q7P", // Valid dummy sol_vault (USDT)
-            "oracle", // Dummy oracle
-            vec!["bin_array1", "bin_array2"], // Dummy bin_arrays
-            None, // No memo program
-            &token_mint_usdt.to_string(),
-            &token_mint_usdc.to_string(),
-        ).unwrap();
-
-        let opps = detector.find_opportunities(&pool_data);
-
-        // Assert that some opportunities are found, without checking specific profit values yet
-        assert!(!opps.is_empty(), "Should find some arbitrage opportunities");
-        // Optionally, print found opportunities for inspection during development
-        for opp in opps {
-            println!("{:?}", opp);
-        }
-    }
-}
-*/

@@ -48,6 +48,9 @@ impl Default for GasFeeConfig {
         multipliers.insert("Meteora".to_string(), 1.1);
         multipliers.insert("Solfi".to_string(), 1.15);
         multipliers.insert("Vertigo".to_string(), 1.1);
+        multipliers.insert("Phoenix".to_string(), 0.85);
+        multipliers.insert("Lifinity".to_string(), 0.95);
+        multipliers.insert("Heaven".to_string(), 1.3);
 
         Self {
             min_profit_to_execute_sol: 0.005,      // OPTIMIZED: 0.5 cents minimum (aggressive)

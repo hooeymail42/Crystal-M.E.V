@@ -22,6 +22,9 @@ use crate::dex::raydium::constants::{raydium_amm_program_id, raydium_cp_amm_prog
 use crate::dex::pump::constants::pump_program_id;
 use crate::dex::meteora::constants::{meteora_dlmm_program_id, meteora_damm_v2_program_id};
 use crate::dex::whirlpool::constants::whirlpool_program_id;
+use crate::dex::phoenix::constants::phoenix_program_id;
+use crate::dex::lifinity::constants::lifinity_program_id;
+use crate::dex::heaven::constants::heaven_program_id;
 
 /// Well-known Jito tip accounts. The bot randomly selects one per bundle
 /// to distribute tips across validators.
@@ -339,6 +342,21 @@ impl TransactionBuilder {
                 }
                 "RaydiumClmm" => {
                     self.build_raydium_clmm_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "Phoenix" => {
+                    self.build_phoenix_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "Lifinity" => {
+                    self.build_lifinity_swap_from_step(
+                        &pool_address, refresh_manager, amount_in, min_amount_out, step,
+                    )?
+                }
+                "Heaven" => {
+                    self.build_heaven_swap_from_step(
                         &pool_address, refresh_manager, amount_in, min_amount_out, step,
                     )?
                 }
@@ -752,6 +770,147 @@ impl TransactionBuilder {
         })
     }
 
+    fn build_phoenix_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = phoenix_program_id();
+
+        let (base_vault, quote_vault, base_mint, quote_mint) = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::Phoenix {
+                base_vault, quote_vault, base_mint, quote_mint, ..
+            }) => {
+                (*base_vault, *quote_vault, *base_mint, *quote_mint)
+            }
+            _ => {
+                return Err(anyhow!("No deserialized state for Phoenix pool {}", pool_address));
+            }
+        };
+
+        let (user_source, user_dest) = if step.action == "buy" {
+            (self.get_user_ata(&quote_mint), self.get_user_ata(&base_mint))
+        } else {
+            (self.get_user_ata(&base_mint), self.get_user_ata(&quote_mint))
+        };
+
+        // Phoenix swap discriminator
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+                AccountMeta::new(user_source, false),
+                AccountMeta::new(user_dest, false),
+                AccountMeta::new(base_vault, false),
+                AccountMeta::new(quote_vault, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+            ],
+            data,
+        })
+    }
+
+    fn build_lifinity_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = lifinity_program_id();
+
+        let (token_a_vault, token_b_vault, token_a_mint, token_b_mint) = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::Lifinity {
+                token_a_vault, token_b_vault, token_a_mint, token_b_mint, ..
+            }) => {
+                (*token_a_vault, *token_b_vault, *token_a_mint, *token_b_mint)
+            }
+            _ => {
+                return Err(anyhow!("No deserialized state for Lifinity pool {}", pool_address));
+            }
+        };
+
+        let (user_source, user_dest) = if step.action == "buy" {
+            (self.get_user_ata(&token_b_mint), self.get_user_ata(&token_a_mint))
+        } else {
+            (self.get_user_ata(&token_a_mint), self.get_user_ata(&token_b_mint))
+        };
+
+        // Lifinity swap discriminator
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new_readonly(self.payer.pubkey(), true),
+                AccountMeta::new(user_source, false),
+                AccountMeta::new(user_dest, false),
+                AccountMeta::new(token_a_vault, false),
+                AccountMeta::new(token_b_vault, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+            ],
+            data,
+        })
+    }
+
+    fn build_heaven_swap_from_step(
+        &self,
+        pool_address: &Pubkey,
+        refresh_manager: &PoolRefreshManager,
+        amount_in: u64,
+        min_amount_out: u64,
+        step: &PathStep,
+    ) -> Result<Instruction> {
+        let program_id = heaven_program_id();
+
+        let mint = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::Heaven { mint, .. }) => *mint,
+            _ => {
+                return Err(anyhow!("No deserialized state for Heaven pool {}", pool_address));
+            }
+        };
+
+        let bonding_curve_token_account = get_associated_token_address(pool_address, &mint);
+        let user_token_account = self.get_user_ata(&mint);
+        let is_buy = step.action == "buy";
+
+        let mut data = Vec::new();
+        if is_buy {
+            data.extend_from_slice(&[102, 6, 61, 18, 1, 218, 235, 234]); // buy discriminator
+        } else {
+            data.extend_from_slice(&[51, 230, 133, 164, 1, 127, 131, 173]); // sell discriminator
+        }
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new(bonding_curve_token_account, false),
+                AccountMeta::new(*pool_address, false),
+                AccountMeta::new(user_token_account, false),
+                AccountMeta::new(self.payer.pubkey(), true),
+            ],
+            data,
+        })
+    }
+
     /// Derive 3 tick array PDAs for Whirlpool based on current tick and direction
     fn derive_whirlpool_tick_arrays(
         pool_address: &Pubkey,
@@ -908,6 +1067,55 @@ impl TransactionBuilder {
 
     pub fn payer_pubkey(&self) -> Pubkey {
         self.payer.pubkey()
+    }
+
+    /// Calculate optimal flash loan borrow amount for an arbitrage opportunity.
+    /// Returns (borrow_lamports, estimated_net_profit_lamports), or None if a
+    /// flash loan would not increase profitability.
+    pub fn calculate_optimal_flashloan(
+        &self,
+        opportunity_input_sol: f64,
+        opportunity_profit_pct: f64,
+        own_capital_lamports: u64,
+    ) -> Option<(u64, u64)> {
+        let kamino_fee_pct = 0.09; // 0.09% Kamino flash loan fee
+
+        if opportunity_profit_pct <= kamino_fee_pct {
+            return None;
+        }
+
+        let opp_input_lamports = (opportunity_input_sol * 1e9) as u64;
+
+        if own_capital_lamports >= opp_input_lamports {
+            // We have enough capital. Only borrow if leveraging improves profit.
+            let profit_own = opportunity_input_sol * (opportunity_profit_pct / 100.0);
+
+            // Try up to 3x leverage
+            let borrow_amount = own_capital_lamports.saturating_mul(3).min(opp_input_lamports * 3);
+            let borrow_sol = borrow_amount as f64 / 1e9;
+
+            let gross_fl = borrow_sol * (opportunity_profit_pct / 100.0);
+            let fl_fee = borrow_sol * (kamino_fee_pct / 100.0);
+            let net_fl = gross_fl - fl_fee;
+
+            if net_fl > profit_own * 1.1 {
+                return Some((borrow_amount, (net_fl * 1e9) as u64));
+            }
+            return None; // Own capital sufficient
+        }
+
+        // Insufficient own capital — borrow the deficit
+        let deficit = opp_input_lamports.saturating_sub(own_capital_lamports);
+        let borrow_sol = deficit as f64 / 1e9;
+        let gross_profit = opportunity_input_sol * (opportunity_profit_pct / 100.0);
+        let fl_fee = borrow_sol * (kamino_fee_pct / 100.0);
+        let net = gross_profit - fl_fee;
+
+        if net > 0.0 {
+            Some((deficit, (net * 1e9) as u64))
+        } else {
+            None
+        }
     }
 
     // --- Kamino Flash Loan Integration ---

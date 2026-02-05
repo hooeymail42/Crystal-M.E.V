@@ -28,6 +28,9 @@ pub enum Pool {
     Solfi(SolfiPool),
     MeteoraDAmmV2(MeteoraDAmmV2Pool),
     Vertigo(VertigoPool),
+    Phoenix(PhoenixPool),
+    Lifinity(LifinityPool),
+    Heaven(HeavenPool),
 }
 
 impl PoolData for Pool {
@@ -42,6 +45,9 @@ impl PoolData for Pool {
             Pool::Solfi(pool) => &pool.pool,
             Pool::MeteoraDAmmV2(pool) => &pool.pool,
             Pool::Vertigo(pool) => &pool.pool,
+            Pool::Phoenix(pool) => &pool.pool,
+            Pool::Lifinity(pool) => &pool.pool,
+            Pool::Heaven(pool) => &pool.pool,
         }
     }
 
@@ -56,6 +62,9 @@ impl PoolData for Pool {
             Pool::Solfi(pool) => &pool.token_x_vault,
             Pool::MeteoraDAmmV2(pool) => &pool.token_x_vault,
             Pool::Vertigo(pool) => &pool.token_x_vault,
+            Pool::Phoenix(pool) => &pool.base_vault,
+            Pool::Lifinity(pool) => &pool.token_a_vault,
+            Pool::Heaven(pool) => &pool.token_x_vault,
         }
     }
 
@@ -70,6 +79,9 @@ impl PoolData for Pool {
             Pool::Solfi(pool) => &pool.token_sol_vault,
             Pool::MeteoraDAmmV2(pool) => &pool.token_sol_vault,
             Pool::Vertigo(pool) => &pool.token_sol_vault,
+            Pool::Phoenix(pool) => &pool.quote_vault,
+            Pool::Lifinity(pool) => &pool.token_b_vault,
+            Pool::Heaven(pool) => &pool.token_sol_vault,
         }
     }
 
@@ -84,6 +96,9 @@ impl PoolData for Pool {
             Pool::Solfi(pool) => &pool.token_mint,
             Pool::MeteoraDAmmV2(pool) => &pool.token_mint,
             Pool::Vertigo(pool) => &pool.token_mint,
+            Pool::Phoenix(pool) => &pool.token_mint,
+            Pool::Lifinity(pool) => &pool.token_mint,
+            Pool::Heaven(pool) => &pool.token_mint,
         }
     }
 
@@ -98,6 +113,9 @@ impl PoolData for Pool {
             Pool::Solfi(pool) => &pool.base_mint,
             Pool::MeteoraDAmmV2(pool) => &pool.base_mint,
             Pool::Vertigo(pool) => &pool.base_mint,
+            Pool::Phoenix(pool) => &pool.base_mint,
+            Pool::Lifinity(pool) => &pool.base_mint,
+            Pool::Heaven(pool) => &pool.base_mint,
         }
     }
 
@@ -112,6 +130,9 @@ impl PoolData for Pool {
             Pool::Solfi(_) => "Solfi",
             Pool::MeteoraDAmmV2(_) => "MeteoraDAmmV2",
             Pool::Vertigo(_) => "Vertigo",
+            Pool::Phoenix(_) => "Phoenix",
+            Pool::Lifinity(_) => "Lifinity",
+            Pool::Heaven(_) => "Heaven",
         }
     }
 }
@@ -321,6 +342,59 @@ impl PoolData for VertigoPool {
     fn get_dex_name(&self) -> &str { "Vertigo" }
 }
 
+#[derive(Debug, Clone)]
+pub struct PhoenixPool {
+    pub pool: Pubkey,
+    pub base_vault: Pubkey,
+    pub quote_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for PhoenixPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.base_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.quote_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Phoenix" }
+}
+
+#[derive(Debug, Clone)]
+pub struct LifinityPool {
+    pub pool: Pubkey,
+    pub token_a_vault: Pubkey,
+    pub token_b_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for LifinityPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_a_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_b_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Lifinity" }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeavenPool {
+    pub pool: Pubkey,
+    pub token_x_vault: Pubkey,
+    pub token_sol_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for HeavenPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Heaven" }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MintPoolData {
@@ -607,6 +681,60 @@ impl MintPoolData {
         self.pools.push(Pool::Vertigo(VertigoPool {
             pool: Pubkey::from_str(pool)?,
             pool_owner: Pubkey::from_str(pool_owner)?,
+            token_x_vault: Pubkey::from_str(token_x_vault)?,
+            token_sol_vault: Pubkey::from_str(token_sol_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
+        Ok(())
+    }
+
+    pub fn add_phoenix_pool(
+        &mut self,
+        pool: &str,
+        base_vault: &str,
+        quote_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Phoenix(PhoenixPool {
+            pool: Pubkey::from_str(pool)?,
+            base_vault: Pubkey::from_str(base_vault)?,
+            quote_vault: Pubkey::from_str(quote_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
+        Ok(())
+    }
+
+    pub fn add_lifinity_pool(
+        &mut self,
+        pool: &str,
+        token_a_vault: &str,
+        token_b_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Lifinity(LifinityPool {
+            pool: Pubkey::from_str(pool)?,
+            token_a_vault: Pubkey::from_str(token_a_vault)?,
+            token_b_vault: Pubkey::from_str(token_b_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
+        Ok(())
+    }
+
+    pub fn add_heaven_pool(
+        &mut self,
+        pool: &str,
+        token_x_vault: &str,
+        token_sol_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Heaven(HeavenPool {
+            pool: Pubkey::from_str(pool)?,
             token_x_vault: Pubkey::from_str(token_x_vault)?,
             token_sol_vault: Pubkey::from_str(token_sol_vault)?,
             token_mint: Pubkey::from_str(token_mint)?,

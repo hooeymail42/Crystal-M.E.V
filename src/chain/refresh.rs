@@ -13,6 +13,9 @@ use crate::dex::pump::amm_info::PumpAmmInfo;
 use crate::dex::meteora::dlmm_info::MeteoraDlmmInfo;
 use crate::dex::meteora::dammv2_info::MeteoraDAmmV2Info;
 use crate::dex::whirlpool::state::Whirlpool;
+use crate::dex::phoenix::state::PhoenixMarketState;
+use crate::dex::lifinity::amm_info::LifinityAmmInfo;
+use crate::dex::heaven::amm_info::HeavenAmmInfo;
 
 /// Cached reserve data for a pool
 #[derive(Debug, Clone)]
@@ -155,6 +158,30 @@ pub enum DeserializedPoolState {
         fee_rate: u16,
         tick_current_index: i32,
         tick_spacing: u16,
+    },
+    Phoenix {
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        taker_fee_bps: u16,
+        best_bid_price: u64,
+        best_ask_price: u64,
+    },
+    Lifinity {
+        token_a_vault: Pubkey,
+        token_b_vault: Pubkey,
+        token_a_mint: Pubkey,
+        token_b_mint: Pubkey,
+    },
+    Heaven {
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+        real_sol_reserves: u64,
+        real_token_reserves: u64,
+        complete: bool,
+        mint: Pubkey,
+        launch_timestamp: i64,
     },
     Unknown,
 }
@@ -394,6 +421,45 @@ impl PoolRefreshManager {
                     Err(_) => DeserializedPoolState::Unknown,
                 }
             }
+            "Phoenix" => {
+                match PhoenixMarketState::try_deserialize(data) {
+                    Ok(info) => DeserializedPoolState::Phoenix {
+                        base_vault: info.base_vault,
+                        quote_vault: info.quote_vault,
+                        base_mint: info.base_mint,
+                        quote_mint: info.quote_mint,
+                        taker_fee_bps: info.taker_fee_bps,
+                        best_bid_price: info.best_bid_price,
+                        best_ask_price: info.best_ask_price,
+                    },
+                    Err(_) => DeserializedPoolState::Unknown,
+                }
+            }
+            "Lifinity" => {
+                match LifinityAmmInfo::try_deserialize(data) {
+                    Ok(info) => DeserializedPoolState::Lifinity {
+                        token_a_vault: info.token_a_vault,
+                        token_b_vault: info.token_b_vault,
+                        token_a_mint: info.token_a_mint,
+                        token_b_mint: info.token_b_mint,
+                    },
+                    Err(_) => DeserializedPoolState::Unknown,
+                }
+            }
+            "Heaven" => {
+                match HeavenAmmInfo::try_deserialize(data) {
+                    Ok(info) => DeserializedPoolState::Heaven {
+                        virtual_sol_reserves: info.virtual_sol_reserves,
+                        virtual_token_reserves: info.virtual_token_reserves,
+                        real_sol_reserves: info.real_sol_reserves,
+                        real_token_reserves: info.real_token_reserves,
+                        complete: info.complete,
+                        mint: info.mint,
+                        launch_timestamp: info.launch_timestamp,
+                    },
+                    Err(_) => DeserializedPoolState::Unknown,
+                }
+            }
             _ => DeserializedPoolState::Unknown,
         }
     }
@@ -425,6 +491,16 @@ impl PoolRefreshManager {
                 }
                 Some(DeserializedPoolState::WhirlpoolState { vault_a, vault_b, .. }) => {
                     (*vault_a, *vault_b)
+                }
+                Some(DeserializedPoolState::Phoenix { base_vault, quote_vault, .. }) => {
+                    (*base_vault, *quote_vault)
+                }
+                Some(DeserializedPoolState::Lifinity { token_a_vault, token_b_vault, .. }) => {
+                    (*token_a_vault, *token_b_vault)
+                }
+                Some(DeserializedPoolState::Heaven { .. }) => {
+                    // Heaven uses virtual reserves from deserialized state, fallback to pool struct vaults
+                    (*pool.token_vault(), *pool.sol_vault())
                 }
                 _ => {
                     // Fallback to pool struct vault addresses
@@ -488,6 +564,21 @@ impl PoolRefreshManager {
         for pool in &pool_data.pools {
             let pool_addr = *pool.pool_address();
             if let Some(DeserializedPoolState::Pump {
+                real_sol_reserves, real_token_reserves, complete, ..
+            }) = self.pool_states.get(&pool_addr) {
+                if !complete {
+                    let entry = self.reserves.entry(pool_addr).or_insert(PoolReserves {
+                        token_reserve: 0,
+                        sol_reserve: 0,
+                        last_updated_slot: 0,
+                    });
+                    entry.token_reserve = *real_token_reserves;
+                    entry.sol_reserve = *real_sol_reserves;
+                }
+            }
+
+            // For Heaven pools, override reserves from deserialized state (uses virtual reserves)
+            if let Some(DeserializedPoolState::Heaven {
                 real_sol_reserves, real_token_reserves, complete, ..
             }) = self.pool_states.get(&pool_addr) {
                 if !complete {

@@ -5,6 +5,7 @@ use solana_sdk::transaction::Transaction;
 use solana_sdk::instruction::Instruction;
 use std::sync::Arc;
 use anyhow::{Result, anyhow};
+use serde_json;
 
 #[derive(Debug)]
 pub struct WalletConfig {
@@ -18,12 +19,28 @@ impl WalletConfig {
             .or_else(|_| std::env::var("SOLANA_KEYPAIR_BASE58"))
             .map_err(|_| anyhow!("SOLANA_KEYPAIR environment variable not set"))?;
 
-        let keypair_bytes = bs58::decode(&keypair_string)
-            .into_vec()
-            .map_err(|_| anyhow!("Invalid base58 keypair"))?;
+        let trimmed = keypair_string.trim();
+
+        // Try JSON array format first: [1,2,3,...] (64 numbers)
+        let keypair_bytes: Vec<u8> = if trimmed.starts_with('[') {
+            serde_json::from_str(trimmed)
+                .map_err(|e| anyhow!("Invalid JSON keypair array: {}", e))?
+        } else {
+            // Try base58 format
+            bs58::decode(trimmed)
+                .into_vec()
+                .map_err(|e| anyhow!("Invalid base58 keypair: {}", e))?
+        };
+
+        if keypair_bytes.len() != 64 {
+            return Err(anyhow!(
+                "Keypair must be 64 bytes, got {} bytes. Check your SOLANA_KEYPAIR value.",
+                keypair_bytes.len()
+            ));
+        }
 
         let keypair = Keypair::from_bytes(&keypair_bytes)
-            .map_err(|_| anyhow!("Invalid keypair bytes"))?;
+            .map_err(|_| anyhow!("Invalid keypair bytes - could not create Keypair"))?;
 
         Ok(Self {
             keypair,

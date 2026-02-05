@@ -59,7 +59,7 @@ pub struct RaydiumAmmInfo {
 
 impl RaydiumAmmInfo {
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < 752 {
+        if data.len() < 744 {
             return Err(anyhow!("Data too short for RaydiumAmmInfo: {} bytes", data.len()));
         }
 
@@ -142,7 +142,7 @@ impl RaydiumAmmInfo {
             pool_withdraw_queue: read_pubkey!(),
             pool_temp_lp_token_account: read_pubkey!(),
             amm_owner: read_pubkey!(),
-            pnl_owner: read_pubkey!(),
+            pnl_owner: if d.len() >= offset + 32 { read_pubkey!() } else { Pubkey::default() },
         })
     }
 
