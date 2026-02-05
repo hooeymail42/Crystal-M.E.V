@@ -250,17 +250,11 @@ impl PoolRefreshManager {
                         let (pool_addr, ref dex_name) = pool_addresses[global_idx];
 
                         if let Some(account) = maybe_account {
-                            if account.data.len() <= 8 {
-                                continue;
+                            if account.data.len() > 8 {
+                                let state = self.deserialize_pool_account(dex_name, &account.data);
+                                self.pool_states.insert(pool_addr, state);
+                                refreshed += 1;
                             }
-
-                            let state = self.deserialize_pool_account(
-                                dex_name,
-                                &account.data,
-                            );
-
-                            self.pool_states.insert(pool_addr, state);
-                            refreshed += 1;
                         }
                     }
                 }
@@ -321,7 +315,8 @@ impl PoolRefreshManager {
         match dex_name {
             "Raydium" => {
                 match RaydiumAmmInfo::try_deserialize(data) {
-                    Ok(info) => DeserializedPoolState::RaydiumAmm {
+                    Ok(info) => {
+                        DeserializedPoolState::RaydiumAmm {
                         coin_vault: info.pool_coin_token_account,
                         pc_vault: info.pool_pc_token_account,
                         coin_mint: info.coin_mint_address,
@@ -333,7 +328,7 @@ impl PoolRefreshManager {
                         amm_target_orders: info.amm_target_orders,
                         serum_market: info.serum_market,
                         serum_program_id: info.serum_program_id,
-                    },
+                    }},
                     Err(_) => DeserializedPoolState::Unknown,
                 }
             }
@@ -504,9 +499,13 @@ impl PoolRefreshManager {
                 }
                 _ => {
                     // Fallback to pool struct vault addresses
+                    warn!("[VaultRefresh] {} using FALLBACK vaults (deserialization may have failed)",
+                        pool.get_dex_name());
                     (*pool.token_vault(), *pool.sol_vault())
                 }
             };
+
+            // Vault addresses extracted from deserialized state
 
             vault_addresses.push(token_vault);
             vault_to_pool.push((pool_addr, true));

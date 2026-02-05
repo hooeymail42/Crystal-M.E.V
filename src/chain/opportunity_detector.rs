@@ -3,6 +3,7 @@ use crate::chain::{
     refresh::{DeserializedPoolState, PoolRefreshManager},
     trading_graph::TradingGraph,
 };
+use tracing::{debug, info};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::cmp::Ordering;
@@ -293,6 +294,15 @@ impl<'a> OpportunityDetector<'a> {
         let pools = &pool_data.pools;
         let token_mint = pool_data.mint.to_string();
 
+        // Log price comparison every 50 iterations for debugging
+        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let should_log = call_num % 50 == 0;
+
+        if should_log {
+            info!("[Arb] Checking {} pools, call #{}", pools.len(), call_num);
+        }
+
         for (i, buy_pool) in pools.iter().enumerate() {
             for (j, sell_pool) in pools.iter().enumerate() {
                 if i == j {
@@ -303,32 +313,59 @@ impl<'a> OpportunityDetector<'a> {
                     buy_pool, sell_pool, refresh_manager,
                 ) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        if should_log {
+                            info!("[Arb] {} -> {}: SKIP (no liquidity/reserves)",
+                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
+                        }
+                        continue;
+                    }
                 };
 
                 let tokens_received = match self.calculate_buy_quote(
                     buy_pool, input_lamports, refresh_manager,
                 ) {
                     Some(v) if v > 0 => v,
-                    _ => continue,
+                    _ => {
+                        if should_log {
+                            info!("[Arb] {} -> {}: SKIP (no buy quote)",
+                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
+                        }
+                        continue;
+                    }
                 };
 
                 let sol_output = match self.calculate_sell_quote(
                     sell_pool, tokens_received, refresh_manager,
                 ) {
                     Some(v) if v > 0 => v,
-                    _ => continue,
+                    _ => {
+                        if should_log {
+                            info!("[Arb] {} -> {}: SKIP (no sell quote)",
+                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
+                        }
+                        continue;
+                    }
                 };
+
+                let input_sol = input_lamports as f64 / 1e9;
+                let output_sol = sol_output as f64 / 1e9;
+                let pnl_sol = output_sol - input_sol;
+                let pnl_pct = (pnl_sol / input_sol) * 100.0;
+
+                if should_log {
+                    info!("[Arb] {} -> {}: in={:.4} SOL, out={:.4} SOL, pnl={:.6} SOL ({:.4}%)",
+                        buy_pool.get_dex_name(), sell_pool.get_dex_name(),
+                        input_sol, output_sol, pnl_sol, pnl_pct);
+                }
 
                 if sol_output <= input_lamports {
                     continue;
                 }
 
                 let profit_lamports = sol_output - input_lamports;
-                let input_sol = input_lamports as f64 / 1e9;
-                let output_sol = sol_output as f64 / 1e9;
                 let profit_sol = profit_lamports as f64 / 1e9;
-                let profit_pct = (profit_sol / input_sol) * 100.0;
+                let profit_pct = pnl_pct;
 
                 if profit_pct < self.config.min_profit_percent {
                     continue;

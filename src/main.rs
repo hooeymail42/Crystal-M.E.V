@@ -118,6 +118,22 @@ async fn main() -> Result<()> {
             }
         }
 
+        for pool_addr in &mint_config.raydium_clmm_pools {
+            if let Err(e) = mpd.add_raydium_clmm_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),  // amm_config
+                &Pubkey::new_unique().to_string(),  // observation_state
+                &Pubkey::new_unique().to_string(),  // x_vault
+                &Pubkey::new_unique().to_string(),  // y_vault
+                vec![],                              // tick_arrays
+                None,                                // memo_program
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Raydium CLMM pool {}: {}", pool_addr, e);
+            }
+        }
+
         for pool_addr in &mint_config.pump_pools {
             if let Err(e) = mpd.add_pump_pool(
                 pool_addr,
@@ -347,7 +363,7 @@ async fn main() -> Result<()> {
                 Ok(balance) => {
                     let sol_balance = balance as f64 / 1e9;
                     info!("[Loop {}] Wallet balance: {:.4} SOL", loop_count, sol_balance);
-                    if sol_balance < 0.01 {
+                    if sol_balance < 0.01 && config.enable_real_execution {
                         warn!("[Loop {}] Balance too low ({:.4} SOL < 0.01 SOL), skipping trading this iteration", loop_count, sol_balance);
                         continue;
                     }
