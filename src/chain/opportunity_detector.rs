@@ -141,6 +141,80 @@ impl<'a> OpportunityDetector<'a> {
                 let out = (*virtual_token_reserves as u128).saturating_sub(new_token);
                 Some(out as u64)
             }
+            Some(DeserializedPoolState::RaydiumClmm {
+                mint_0, sqrt_price_x64, liquidity, fee_rate, ..
+            }) => {
+                // CLMM tick-based math: determine direction based on which mint is SOL
+                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
+                let is_sol_mint_0 = *mint_0 == sol_mint;
+
+                if *liquidity == 0 || *sqrt_price_x64 == 0 {
+                    return None;
+                }
+
+                // Apply fee (fee_rate is per million)
+                let fee_amount = (sol_amount_in as u128) * (*fee_rate as u128) / 1_000_000;
+                let amount_after_fee = (sol_amount_in as u128).saturating_sub(fee_amount);
+
+                let l = *liquidity;
+                let sqrt_p = *sqrt_price_x64;
+
+                if is_sol_mint_0 {
+                    // SOL is token_0, buying token_1: use 0_to_1 formula
+                    // new_sqrt_price = L * sqrt_price / (L + delta_0 * sqrt_price / 2^64)
+                    let denominator = l + (amount_after_fee * sqrt_p) / (1u128 << 64);
+                    if denominator == 0 { return None; }
+                    let new_sqrt_price = l * sqrt_p / denominator;
+                    // delta_1 = L * (sqrt_price - new_sqrt_price) / 2^64
+                    let delta_out = if sqrt_p > new_sqrt_price {
+                        l * (sqrt_p - new_sqrt_price) / (1u128 << 64)
+                    } else { 0 };
+                    Some(delta_out as u64)
+                } else {
+                    // SOL is token_1, buying token_0: use 1_to_0 formula
+                    // new_sqrt_price = sqrt_price + delta_1 * 2^64 / L
+                    let new_sqrt_price = sqrt_p + (amount_after_fee * (1u128 << 64)) / l;
+                    // delta_0 = L * (new_sqrt_price - sqrt_price) / (sqrt_price * new_sqrt_price / 2^64)
+                    let numerator = l * (new_sqrt_price - sqrt_p);
+                    let denom_factor = (sqrt_p / (1u128 << 32)) * (new_sqrt_price / (1u128 << 32));
+                    let delta_out = if denom_factor > 0 { numerator / denom_factor } else { 0 };
+                    Some(delta_out as u64)
+                }
+            }
+            Some(DeserializedPoolState::WhirlpoolState {
+                mint_a, sqrt_price, liquidity, fee_rate, ..
+            }) => {
+                // Whirlpool CLMM math using floats
+                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
+                let is_sol_mint_a = *mint_a == sol_mint;
+
+                if *liquidity == 0 || *sqrt_price == 0 {
+                    return None;
+                }
+
+                let sqrt_price_f = *sqrt_price as f64 / (1u128 << 64) as f64;
+                let liquidity_f = *liquidity as f64;
+
+                // fee_rate is in hundredths of bps (parts per million)
+                let fee_amount = (sol_amount_in as u128 * *fee_rate as u128 / 1_000_000) as u64;
+                let amount_after_fee = sol_amount_in.saturating_sub(fee_amount);
+
+                if is_sol_mint_a {
+                    // SOL is token_a, buying token_b: a_to_b
+                    let new_sqrt_price = liquidity_f * sqrt_price_f
+                        / (liquidity_f + amount_after_fee as f64 * sqrt_price_f);
+                    if new_sqrt_price <= 0.0 || new_sqrt_price >= sqrt_price_f {
+                        return None;
+                    }
+                    let delta_b = liquidity_f * (sqrt_price_f - new_sqrt_price);
+                    Some(delta_b as u64)
+                } else {
+                    // SOL is token_b, buying token_a: b_to_a
+                    let new_sqrt_price = sqrt_price_f + amount_after_fee as f64 / liquidity_f;
+                    let delta_a = liquidity_f * (1.0 / sqrt_price_f - 1.0 / new_sqrt_price);
+                    Some(delta_a as u64)
+                }
+            }
             _ => {
                 // Generic constant-product with fee
                 let (token_reserve, sol_reserve) =
@@ -197,6 +271,74 @@ impl<'a> OpportunityDetector<'a> {
                 let sol_out = (*virtual_sol_reserves as u128).saturating_sub(new_sol);
                 let fee = sol_out / 100;
                 Some(sol_out.saturating_sub(fee) as u64)
+            }
+            Some(DeserializedPoolState::RaydiumClmm {
+                mint_0, sqrt_price_x64, liquidity, fee_rate, ..
+            }) => {
+                // CLMM tick-based math: Token -> SOL (reverse direction)
+                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
+                let is_sol_mint_0 = *mint_0 == sol_mint;
+
+                if *liquidity == 0 || *sqrt_price_x64 == 0 {
+                    return None;
+                }
+
+                let fee_amount = (token_amount_in as u128) * (*fee_rate as u128) / 1_000_000;
+                let amount_after_fee = (token_amount_in as u128).saturating_sub(fee_amount);
+
+                let l = *liquidity;
+                let sqrt_p = *sqrt_price_x64;
+
+                if is_sol_mint_0 {
+                    // SOL is token_0, selling token_1 for SOL: use 1_to_0 formula
+                    let new_sqrt_price = sqrt_p + (amount_after_fee * (1u128 << 64)) / l;
+                    let numerator = l * (new_sqrt_price - sqrt_p);
+                    let denom_factor = (sqrt_p / (1u128 << 32)) * (new_sqrt_price / (1u128 << 32));
+                    let delta_out = if denom_factor > 0 { numerator / denom_factor } else { 0 };
+                    Some(delta_out as u64)
+                } else {
+                    // SOL is token_1, selling token_0 for SOL: use 0_to_1 formula
+                    let denominator = l + (amount_after_fee * sqrt_p) / (1u128 << 64);
+                    if denominator == 0 { return None; }
+                    let new_sqrt_price = l * sqrt_p / denominator;
+                    let delta_out = if sqrt_p > new_sqrt_price {
+                        l * (sqrt_p - new_sqrt_price) / (1u128 << 64)
+                    } else { 0 };
+                    Some(delta_out as u64)
+                }
+            }
+            Some(DeserializedPoolState::WhirlpoolState {
+                mint_a, sqrt_price, liquidity, fee_rate, ..
+            }) => {
+                // Whirlpool CLMM math: Token -> SOL (reverse direction)
+                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
+                let is_sol_mint_a = *mint_a == sol_mint;
+
+                if *liquidity == 0 || *sqrt_price == 0 {
+                    return None;
+                }
+
+                let sqrt_price_f = *sqrt_price as f64 / (1u128 << 64) as f64;
+                let liquidity_f = *liquidity as f64;
+
+                let fee_amount = (token_amount_in as u128 * *fee_rate as u128 / 1_000_000) as u64;
+                let amount_after_fee = token_amount_in.saturating_sub(fee_amount);
+
+                if is_sol_mint_a {
+                    // SOL is token_a, selling token_b for SOL: b_to_a
+                    let new_sqrt_price = sqrt_price_f + amount_after_fee as f64 / liquidity_f;
+                    let delta_a = liquidity_f * (1.0 / sqrt_price_f - 1.0 / new_sqrt_price);
+                    Some(delta_a as u64)
+                } else {
+                    // SOL is token_b, selling token_a for SOL: a_to_b
+                    let new_sqrt_price = liquidity_f * sqrt_price_f
+                        / (liquidity_f + amount_after_fee as f64 * sqrt_price_f);
+                    if new_sqrt_price <= 0.0 || new_sqrt_price >= sqrt_price_f {
+                        return None;
+                    }
+                    let delta_b = liquidity_f * (sqrt_price_f - new_sqrt_price);
+                    Some(delta_b as u64)
+                }
             }
             _ => {
                 let (token_reserve, sol_reserve) =
