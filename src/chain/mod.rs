@@ -1,6 +1,8 @@
 pub mod advanced_mev_detection;
 pub mod capital_manager;
 pub mod constants;
+pub mod cu_estimator;
+pub mod priority_fee;
 pub mod gas_fee;
 pub mod opportunity_detector;
 pub mod pool_discovery;

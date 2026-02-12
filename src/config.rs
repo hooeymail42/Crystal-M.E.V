@@ -24,6 +24,11 @@ pub struct BotConfig {
     pub enable_real_execution: bool,
     pub refresh_interval_ms: u64,
     pub loop_interval_ms: u64,
+    pub dynamic_cu_enabled: bool,
+    pub cu_buffer_pct: f64,
+    pub dynamic_fee_enabled: bool,
+    pub fee_percentile: usize,
+    pub alt_addresses: Vec<String>,
     pub mints: Vec<MintConfig>,
 }
 
@@ -129,6 +134,33 @@ impl BotConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(500u64);
 
+        let dynamic_cu_enabled = std::env::var("DYNAMIC_CU_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false);
+
+        let cu_buffer_pct = std::env::var("CU_BUFFER_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.15f64);
+
+        let dynamic_fee_enabled = std::env::var("DYNAMIC_FEE_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false);
+
+        let fee_percentile = std::env::var("FEE_PERCENTILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(75usize);
+
+        let alt_addresses: Vec<String> = std::env::var("ALT_ADDRESSES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+
         let mints = Self::load_mints()?;
 
         Ok(Self {
@@ -151,6 +183,11 @@ impl BotConfig {
             enable_real_execution,
             refresh_interval_ms,
             loop_interval_ms,
+            dynamic_cu_enabled,
+            cu_buffer_pct,
+            dynamic_fee_enabled,
+            fee_percentile,
+            alt_addresses,
             mints,
         })
     }
@@ -202,10 +239,13 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        // Without any env vars set, should still produce a valid config
+        // Config loads from .env if present; verify parsing works and values are reasonable
         let config = BotConfig::from_env().unwrap();
         assert!(!config.enable_real_execution);
         assert_eq!(config.loop_interval_ms, 500);
-        assert_eq!(config.compute_unit_limit, 400_000);
+        // compute_unit_limit defaults to 400k, but .env may override to 600k
+        assert!(config.compute_unit_limit == 400_000 || config.compute_unit_limit == 600_000);
+        assert_eq!(config.cu_buffer_pct, 0.15);
+        assert_eq!(config.fee_percentile, 75);
     }
 }

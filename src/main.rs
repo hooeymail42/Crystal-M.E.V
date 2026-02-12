@@ -63,7 +63,18 @@ async fn main() -> Result<()> {
 
     let payer = Arc::new(wallet.keypair);
 
-    let tx_builder = TransactionBuilder::new(
+    // Load Address Lookup Tables
+    let alt_accounts = if !config.alt_addresses.is_empty() {
+        let alt_keys: Vec<Pubkey> = config.alt_addresses.iter()
+            .filter_map(|s| Pubkey::from_str(s).ok())
+            .collect();
+        TransactionBuilder::load_lookup_tables(&rpc, &alt_keys)
+    } else {
+        vec![]
+    };
+    info!("Loaded {} Address Lookup Tables", alt_accounts.len());
+
+    let mut tx_builder = TransactionBuilder::new(
         rpc.clone(),
         payer,
         config.compute_unit_limit,
@@ -75,11 +86,22 @@ async fn main() -> Result<()> {
         config.jito_enabled,
         config.jito_tip_lamports,
         config.jito_block_engine_url.clone(),
-    );
+    )
+    .with_dynamic_cu(config.dynamic_cu_enabled, config.cu_buffer_pct)
+    .with_dynamic_fee(config.dynamic_fee_enabled, config.fee_percentile)
+    .with_lookup_tables(alt_accounts);
 
     if config.jito_enabled {
         info!("Jito MEV bundles enabled: tip={} lamports, engine={}",
             config.jito_tip_lamports, config.jito_block_engine_url);
+    }
+
+    if config.dynamic_cu_enabled {
+        info!("Dynamic CU estimation enabled: buffer={:.0}%", config.cu_buffer_pct * 100.0);
+    }
+
+    if config.dynamic_fee_enabled {
+        info!("Dynamic priority fees enabled: percentile=p{}", config.fee_percentile);
     }
 
     // Initialize capital manager for auto-compounding and dynamic position sizing
@@ -355,6 +377,11 @@ async fn main() -> Result<()> {
                 warn!("[Drawdown Protection] Paused: {:.1}% drawdown from peak", capital_manager.drawdown_percent());
             }
             continue;
+        }
+
+        // Refresh dynamic priority fee periodically (every 20 loops ~10s at 500ms interval)
+        if config.dynamic_fee_enabled && loop_count % 20 == 0 {
+            tx_builder.refresh_priority_fee(&[]);
         }
 
         // Periodic balance monitoring (every 50 loops)

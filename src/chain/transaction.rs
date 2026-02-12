@@ -2,14 +2,15 @@ use anyhow::{Result, anyhow};
 use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    address_lookup_table_account::AddressLookupTableAccount,
     compute_budget::ComputeBudgetInstruction,
     hash::Hash,
     instruction::{AccountMeta, Instruction},
-    message::Message,
+    message::{VersionedMessage, v0},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
-    transaction::Transaction,
+    transaction::VersionedTransaction,
 };
 use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
@@ -50,6 +51,18 @@ pub struct TransactionBuilder {
     jito_enabled: bool,
     jito_tip_lamports: u64,
     jito_block_engine_url: String,
+    /// When true, estimate CU from simulation instead of using compute_unit_limit
+    dynamic_cu_enabled: bool,
+    /// Buffer percentage added on top of simulated CU (e.g., 0.15 = 15%)
+    cu_buffer_pct: f64,
+    /// When true, fetch priority fee from network instead of using priority_fee_lamports
+    dynamic_fee_enabled: bool,
+    /// Percentile of recent fees to use (0-100)
+    fee_percentile: usize,
+    /// Cached dynamic priority fee in microlamports per CU
+    cached_priority_fee_microlamports: u64,
+    /// Address Lookup Tables for v0 transaction compression
+    address_lookup_tables: Vec<AddressLookupTableAccount>,
 }
 
 impl TransactionBuilder {
@@ -71,6 +84,12 @@ impl TransactionBuilder {
             jito_enabled: false,
             jito_tip_lamports: 0,
             jito_block_engine_url: String::new(),
+            dynamic_cu_enabled: false,
+            cu_buffer_pct: 0.15,
+            dynamic_fee_enabled: false,
+            fee_percentile: 75,
+            cached_priority_fee_microlamports: 0,
+            address_lookup_tables: vec![],
         }
     }
 
@@ -82,9 +101,178 @@ impl TransactionBuilder {
         self
     }
 
+    /// Enable dynamic CU estimation from simulation results.
+    pub fn with_dynamic_cu(mut self, enabled: bool, buffer_pct: f64) -> Self {
+        self.dynamic_cu_enabled = enabled;
+        self.cu_buffer_pct = buffer_pct;
+        self
+    }
+
+    /// Enable dynamic priority fee from `getRecentPrioritizationFees`.
+    pub fn with_dynamic_fee(mut self, enabled: bool, percentile: usize) -> Self {
+        self.dynamic_fee_enabled = enabled;
+        self.fee_percentile = percentile.min(100);
+        self
+    }
+
+    /// Set Address Lookup Tables for v0 transaction compression.
+    pub fn with_lookup_tables(mut self, tables: Vec<AddressLookupTableAccount>) -> Self {
+        self.address_lookup_tables = tables;
+        self
+    }
+
+    /// Fetch and deserialize Address Lookup Tables from RPC.
+    /// Skips any tables that fail to load (logs a warning).
+    pub fn load_lookup_tables(rpc: &RpcClient, alt_keys: &[Pubkey]) -> Vec<AddressLookupTableAccount> {
+        let mut tables = Vec::with_capacity(alt_keys.len());
+        for key in alt_keys {
+            match rpc.get_account(key) {
+                Ok(account) => {
+                    match solana_program::address_lookup_table::state::AddressLookupTable::deserialize(&account.data) {
+                        Ok(alt) => {
+                            tables.push(AddressLookupTableAccount {
+                                key: *key,
+                                addresses: alt.addresses.to_vec(),
+                            });
+                            info!("Loaded ALT {} with {} addresses", key, alt.addresses.len());
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize ALT {}: {}", key, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch ALT account {}: {}", key, e);
+                }
+            }
+        }
+        tables
+    }
+
     /// Returns true if Jito bundle submission is enabled.
     pub fn is_jito_enabled(&self) -> bool {
         self.jito_enabled
+    }
+
+    /// Simulate swap instructions with max CU budget to measure actual consumption.
+    /// Returns `(simulation_passed, units_consumed)`.
+    pub fn estimate_cu_from_simulation(
+        &self,
+        swap_instructions: &[Instruction],
+    ) -> Result<(bool, u64)> {
+        let mut sim_ixs = Vec::with_capacity(swap_instructions.len() + 1);
+        sim_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(1_400_000));
+        sim_ixs.extend_from_slice(swap_instructions);
+
+        let blockhash = self.rpc.get_latest_blockhash()?;
+        let tx = self.build_versioned_tx(&sim_ixs, blockhash)?;
+
+        let result = self.rpc.simulate_transaction(&tx)?;
+
+        let passed = result.value.err.is_none();
+        let units = result.value.units_consumed.unwrap_or(0);
+
+        Ok((passed, units))
+    }
+
+    /// Compute the CU limit to use: either dynamic (from simulation) or static fallback.
+    fn resolve_cu_limit(&self, swap_instructions: &[Instruction]) -> u32 {
+        if !self.dynamic_cu_enabled {
+            return self.compute_unit_limit;
+        }
+
+        match self.estimate_cu_from_simulation(swap_instructions) {
+            Ok((true, actual_cu)) if actual_cu > 0 => {
+                let buffered = (actual_cu as f64 * (1.0 + self.cu_buffer_pct)) as u32;
+                let clamped = buffered.clamp(50_000, 1_400_000);
+                info!("Dynamic CU: actual={}, limit={} (+{}% buffer)", actual_cu, clamped, (self.cu_buffer_pct * 100.0) as u32);
+                clamped
+            }
+            Ok((false, _)) => {
+                warn!("Dynamic CU sim failed, using static limit {}", self.compute_unit_limit);
+                self.compute_unit_limit
+            }
+            Ok(_) => {
+                warn!("Dynamic CU sim returned 0, using static limit {}", self.compute_unit_limit);
+                self.compute_unit_limit
+            }
+            Err(e) => {
+                warn!("Dynamic CU estimation error, using static {}: {}", self.compute_unit_limit, e);
+                self.compute_unit_limit
+            }
+        }
+    }
+
+    /// Fetch recent prioritization fees for the given writable accounts.
+    /// Updates the cached fee and returns microlamports per CU.
+    pub fn refresh_priority_fee(&mut self, writable_accounts: &[Pubkey]) -> u64 {
+        if !self.dynamic_fee_enabled {
+            // Convert static lamports to microlamports per CU
+            if self.priority_fee_lamports > 0 && self.compute_unit_limit > 0 {
+                return (self.priority_fee_lamports * 1_000_000) / self.compute_unit_limit as u64;
+            }
+            return 0;
+        }
+
+        let accounts: Vec<Pubkey> = writable_accounts.iter().take(128).copied().collect();
+        match self.rpc.get_recent_prioritization_fees(&accounts) {
+            Ok(response) => {
+                let mut fees: Vec<u64> = response
+                    .iter()
+                    .map(|f| f.prioritization_fee)
+                    .filter(|&f| f > 0)
+                    .collect();
+
+                if fees.is_empty() {
+                    self.cached_priority_fee_microlamports = 100; // minimum floor
+                } else {
+                    fees.sort_unstable();
+                    let idx = (fees.len() * self.fee_percentile / 100).min(fees.len() - 1);
+                    self.cached_priority_fee_microlamports = fees[idx].clamp(100, 1_000_000);
+                }
+
+                info!(
+                    "Dynamic priority fee: {} microlamports/CU (p{}, {} samples)",
+                    self.cached_priority_fee_microlamports,
+                    self.fee_percentile,
+                    fees.len()
+                );
+                self.cached_priority_fee_microlamports
+            }
+            Err(e) => {
+                warn!("Failed to fetch priority fees: {}", e);
+                if self.cached_priority_fee_microlamports > 0 {
+                    self.cached_priority_fee_microlamports
+                } else {
+                    100 // minimum floor
+                }
+            }
+        }
+    }
+
+    /// Get the current priority fee in microlamports per CU (cached or static).
+    fn resolve_priority_fee_microlamports(&self, cu_limit: u32) -> u64 {
+        if self.dynamic_fee_enabled && self.cached_priority_fee_microlamports > 0 {
+            return self.cached_priority_fee_microlamports;
+        }
+        if self.priority_fee_lamports > 0 && cu_limit > 0 {
+            return (self.priority_fee_lamports * 1_000_000) / cu_limit as u64;
+        }
+        0
+    }
+
+    /// Build compute budget instructions (CU limit + priority fee) for a set of swap IXs.
+    /// Uses dynamic estimation when enabled.
+    fn build_compute_budget_ixs(&self, swap_instructions: &[Instruction]) -> Vec<Instruction> {
+        let cu_limit = self.resolve_cu_limit(swap_instructions);
+        let fee_microlamports = self.resolve_priority_fee_microlamports(cu_limit);
+
+        let mut ixs = Vec::with_capacity(2);
+        ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(cu_limit));
+        if fee_microlamports > 0 {
+            ixs.push(ComputeBudgetInstruction::set_compute_unit_price(fee_microlamports));
+        }
+        ixs
     }
 
     /// Derive user's Associated Token Account for a given mint
@@ -98,36 +286,40 @@ impl TransactionBuilder {
         Pubkey::from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1").unwrap()
     }
 
-    /// Build a transaction with compute budget instructions prepended
+    /// Build a versioned (v0) transaction from instructions and a blockhash.
+    /// Uses Address Lookup Tables when available for account compression.
+    fn build_versioned_tx(&self, instructions: &[Instruction], blockhash: Hash) -> Result<VersionedTransaction> {
+        let message = v0::Message::try_compile(
+            &self.payer.pubkey(),
+            instructions,
+            &self.address_lookup_tables,
+            blockhash,
+        )?;
+        let tx = VersionedTransaction::try_new(
+            VersionedMessage::V0(message),
+            &[self.payer.as_ref()],
+        )?;
+        Ok(tx)
+    }
+
+    /// Build a transaction with compute budget instructions prepended.
+    /// Uses dynamic CU estimation and priority fees when enabled.
     pub fn build_swap_transaction(
         &self,
         swap_instructions: Vec<Instruction>,
         recent_blockhash: Hash,
-    ) -> Result<Transaction> {
-        let mut instructions = Vec::with_capacity(swap_instructions.len() + 2);
+    ) -> Result<VersionedTransaction> {
+        let budget_ixs = self.build_compute_budget_ixs(&swap_instructions);
+        let mut instructions = Vec::with_capacity(swap_instructions.len() + budget_ixs.len());
 
-        instructions.push(
-            ComputeBudgetInstruction::set_compute_unit_limit(self.compute_unit_limit)
-        );
-
-        if self.priority_fee_lamports > 0 {
-            let microlamports_per_cu = (self.priority_fee_lamports * 1_000_000) / self.compute_unit_limit as u64;
-            instructions.push(
-                ComputeBudgetInstruction::set_compute_unit_price(microlamports_per_cu)
-            );
-        }
-
+        instructions.extend(budget_ixs);
         instructions.extend(swap_instructions);
 
-        let message = Message::new(&instructions, Some(&self.payer.pubkey()));
-        let mut tx = Transaction::new_unsigned(message);
-        tx.sign(&[self.payer.as_ref()], recent_blockhash);
-
-        Ok(tx)
+        self.build_versioned_tx(&instructions, recent_blockhash)
     }
 
     /// Simulate a transaction without sending it
-    pub fn simulate(&self, tx: &Transaction) -> Result<bool> {
+    pub fn simulate(&self, tx: &VersionedTransaction) -> Result<bool> {
         let result = self.rpc.simulate_transaction(tx)?;
 
         if let Some(err) = result.value.err {
@@ -141,9 +333,13 @@ impl TransactionBuilder {
     }
 
     /// Send transaction and wait for confirmation
-    pub fn send_and_confirm(&self, tx: &Transaction) -> Result<String> {
+    pub fn send_and_confirm(&self, tx: &VersionedTransaction) -> Result<String> {
         if !self.real_execution {
-            info!("[DEMO] Would send transaction with {} instructions", tx.message.instructions.len());
+            let ix_count = match &tx.message {
+                VersionedMessage::V0(m) => m.instructions.len(),
+                VersionedMessage::Legacy(m) => m.instructions.len(),
+            };
+            info!("[DEMO] Would send transaction with {} instructions", ix_count);
             return Ok(format!("demo_sig_{}", self.payer.pubkey()));
         }
 
@@ -153,7 +349,7 @@ impl TransactionBuilder {
     }
 
     /// Submit transaction across multiple RPC endpoints in parallel
-    pub async fn parallel_submit(&self, tx: &Transaction) -> Result<String> {
+    pub async fn parallel_submit(&self, tx: &VersionedTransaction) -> Result<String> {
         if !self.real_execution {
             info!("[DEMO] Would parallel submit across {} RPC endpoints", self.spam_rpc_urls.len() + 1);
             return Ok(format!("demo_sig_{}", self.payer.pubkey()));
@@ -193,20 +389,12 @@ impl TransactionBuilder {
         &self,
         swap_instructions: Vec<Instruction>,
         recent_blockhash: Hash,
-    ) -> Result<Transaction> {
-        let mut instructions = Vec::with_capacity(swap_instructions.len() + 3);
+    ) -> Result<VersionedTransaction> {
+        let budget_ixs = self.build_compute_budget_ixs(&swap_instructions);
+        let mut instructions = Vec::with_capacity(swap_instructions.len() + budget_ixs.len() + 1);
 
-        // Compute budget instructions (same as regular path)
-        instructions.push(
-            ComputeBudgetInstruction::set_compute_unit_limit(self.compute_unit_limit)
-        );
-        if self.priority_fee_lamports > 0 {
-            let microlamports_per_cu =
-                (self.priority_fee_lamports * 1_000_000) / self.compute_unit_limit as u64;
-            instructions.push(
-                ComputeBudgetInstruction::set_compute_unit_price(microlamports_per_cu)
-            );
-        }
+        // Compute budget instructions (dynamic when enabled)
+        instructions.extend(budget_ixs);
 
         // Swap instructions
         instructions.extend(swap_instructions);
@@ -217,13 +405,10 @@ impl TransactionBuilder {
             system_instruction::transfer(&self.payer.pubkey(), &tip_account, self.jito_tip_lamports)
         );
 
-        let message = Message::new(&instructions, Some(&self.payer.pubkey()));
-        let mut tx = Transaction::new_unsigned(message);
-        tx.sign(&[self.payer.as_ref()], recent_blockhash);
+        let tx = self.build_versioned_tx(&instructions, recent_blockhash)?;
 
         info!(
-            "Built Jito bundle TX: {} instructions, tip={} lamports to {}",
-            tx.message.instructions.len(),
+            "Built Jito bundle TX: tip={} lamports to {}",
             self.jito_tip_lamports,
             tip_account,
         );
@@ -233,11 +418,10 @@ impl TransactionBuilder {
 
     /// Submit a signed transaction as a Jito MEV bundle via the block engine API.
     /// Returns the bundle ID on success.
-    pub fn submit_jito_bundle(&self, tx: &Transaction) -> Result<String> {
+    pub fn submit_jito_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         if !self.real_execution {
             info!(
-                "[DEMO] Would submit Jito bundle with {} instructions, tip={} lamports",
-                tx.message.instructions.len(),
+                "[DEMO] Would submit Jito bundle, tip={} lamports",
                 self.jito_tip_lamports,
             );
             return Ok(format!("demo_jito_bundle_{}", self.payer.pubkey()));
@@ -1230,21 +1414,12 @@ impl TransactionBuilder {
         reserve_vault: &Pubkey,
         fee_receiver: &Pubkey,
         recent_blockhash: Hash,
-    ) -> Result<Transaction> {
+    ) -> Result<VersionedTransaction> {
         let mut instructions = Vec::with_capacity(swap_instructions.len() + 4);
 
-        // idx 0: compute budget (higher for flash loan TXs)
-        instructions.push(
-            ComputeBudgetInstruction::set_compute_unit_limit(600_000)
-        );
-
-        // idx 1: priority fee
-        if self.priority_fee_lamports > 0 {
-            let microlamports_per_cu = (self.priority_fee_lamports * 1_000_000) / 600_000;
-            instructions.push(
-                ComputeBudgetInstruction::set_compute_unit_price(microlamports_per_cu)
-            );
-        }
+        // Compute budget: use dynamic CU/fee when enabled, otherwise higher static limit for flash loans
+        let budget_ixs = self.build_compute_budget_ixs(&swap_instructions);
+        instructions.extend(budget_ixs);
 
         // idx 2: flash borrow
         let borrow_ix_index = instructions.len() as u8;
@@ -1262,11 +1437,7 @@ impl TransactionBuilder {
             repay_amount, borrow_ix_index, reserve, reserve_vault, fee_receiver,
         ));
 
-        let message = Message::new(&instructions, Some(&self.payer.pubkey()));
-        let mut tx = Transaction::new_unsigned(message);
-        tx.sign(&[self.payer.as_ref()], recent_blockhash);
-
-        Ok(tx)
+        self.build_versioned_tx(&instructions, recent_blockhash)
     }
 }
 
@@ -1396,7 +1567,11 @@ mod tests {
 
         let tx = builder.build_jito_bundle(vec![swap_ix], blockhash).unwrap();
         // Should have: compute limit + compute price + swap ix + tip transfer = 4 instructions
-        assert_eq!(tx.message.instructions.len(), 4);
+        let ix_count = match &tx.message {
+            VersionedMessage::V0(m) => m.instructions.len(),
+            VersionedMessage::Legacy(m) => m.instructions.len(),
+        };
+        assert_eq!(ix_count, 4);
     }
 
     #[test]
@@ -1417,5 +1592,70 @@ mod tests {
         // In demo mode (real_execution=false), should return demo bundle ID
         let result = builder.submit_jito_bundle(&tx).unwrap();
         assert!(result.starts_with("demo_jito_bundle_"));
+    }
+
+    #[test]
+    fn test_build_versioned_tx_without_alts() {
+        let rpc = Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string()));
+        let payer = Arc::new(Keypair::new());
+        let builder = TransactionBuilder::new(rpc, payer, 400_000, 10_000, vec![], false);
+
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let ix = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![],
+            data: vec![1, 2, 3],
+        };
+
+        let tx = builder.build_swap_transaction(vec![ix], blockhash).unwrap();
+        // Should produce a v0 message even without ALTs
+        assert!(matches!(tx.message, VersionedMessage::V0(_)));
+    }
+
+    #[test]
+    fn test_build_versioned_tx_with_alts() {
+        let rpc = Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string()));
+        let payer = Arc::new(Keypair::new());
+
+        // Create a mock ALT with some addresses
+        let alt_key = Pubkey::new_unique();
+        let alt_addresses: Vec<Pubkey> = (0..10).map(|_| Pubkey::new_unique()).collect();
+        let alt = AddressLookupTableAccount {
+            key: alt_key,
+            addresses: alt_addresses.clone(),
+        };
+
+        let builder = TransactionBuilder::new(rpc, payer.clone(), 400_000, 10_000, vec![], false)
+            .with_lookup_tables(vec![alt]);
+
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        // Build an instruction that references ALT addresses
+        let ix = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: alt_addresses.iter().map(|a| AccountMeta::new(*a, false)).collect(),
+            data: vec![1, 2, 3],
+        };
+
+        let tx = builder.build_swap_transaction(vec![ix], blockhash).unwrap();
+        match &tx.message {
+            VersionedMessage::V0(m) => {
+                // Should have address table lookups
+                assert!(!m.address_table_lookups.is_empty(), "Expected ALT lookups in v0 message");
+            }
+            _ => panic!("Expected V0 message"),
+        }
+    }
+
+    #[test]
+    fn test_with_lookup_tables() {
+        let rpc = Arc::new(RpcClient::new("https://api.mainnet-beta.solana.com".to_string()));
+        let payer = Arc::new(Keypair::new());
+        let alt = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: vec![Pubkey::new_unique()],
+        };
+        let builder = TransactionBuilder::new(rpc, payer, 400_000, 10_000, vec![], false)
+            .with_lookup_tables(vec![alt]);
+        assert_eq!(builder.address_lookup_tables.len(), 1);
     }
 }
