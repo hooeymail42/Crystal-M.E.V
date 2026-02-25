@@ -1,9 +1,7 @@
+#![allow(dead_code)]
 use crate::{
     chain::constants::SOL_MINT,
-    dex::{
-        raydium::{POOL_TICK_ARRAY_BITMAP_SEED, raydium_clmm_program_id},
-        Dex,
-    },
+    dex::raydium::{POOL_TICK_ARRAY_BITMAP_SEED, raydium_clmm_program_id},
 };
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -20,6 +18,7 @@ pub trait PoolData {
 #[derive(Debug, Clone)]
 pub enum Pool {
     Raydium(RaydiumPool),
+    RaydiumCp(RaydiumCpPool),
     Pump(PumpPool),
     Dlmm(DlmmPool),
     Whirlpool(WhirlpoolPool),
@@ -37,6 +36,7 @@ impl PoolData for Pool {
     fn pool_address(&self) -> &Pubkey {
         match self {
             Pool::Raydium(pool) => &pool.pool,
+            Pool::RaydiumCp(pool) => &pool.pool,
             Pool::Pump(pool) => &pool.pool,
             Pool::Dlmm(pool) => &pool.pair,
             Pool::Whirlpool(pool) => &pool.pool,
@@ -54,6 +54,7 @@ impl PoolData for Pool {
     fn token_vault(&self) -> &Pubkey {
         match self {
             Pool::Raydium(pool) => &pool.token_vault,
+            Pool::RaydiumCp(pool) => &pool.token_vault,
             Pool::Pump(pool) => &pool.token_vault,
             Pool::Dlmm(pool) => &pool.token_vault,
             Pool::Whirlpool(pool) => &pool.x_vault, // Assuming x_vault is token_vault
@@ -71,6 +72,7 @@ impl PoolData for Pool {
     fn sol_vault(&self) -> &Pubkey {
         match self {
             Pool::Raydium(pool) => &pool.sol_vault,
+            Pool::RaydiumCp(pool) => &pool.sol_vault,
             Pool::Pump(pool) => &pool.sol_vault,
             Pool::Dlmm(pool) => &pool.sol_vault,
             Pool::Whirlpool(pool) => &pool.y_vault, // Assuming y_vault is sol_vault
@@ -88,6 +90,7 @@ impl PoolData for Pool {
     fn token_mint(&self) -> &Pubkey {
         match self {
             Pool::Raydium(pool) => &pool.token_mint,
+            Pool::RaydiumCp(pool) => &pool.token_mint,
             Pool::Pump(pool) => &pool.token_mint,
             Pool::Dlmm(pool) => &pool.token_mint,
             Pool::Whirlpool(pool) => &pool.token_mint,
@@ -105,6 +108,7 @@ impl PoolData for Pool {
     fn base_mint(&self) -> &Pubkey {
         match self {
             Pool::Raydium(pool) => &pool.base_mint,
+            Pool::RaydiumCp(pool) => &pool.base_mint,
             Pool::Pump(pool) => &pool.base_mint,
             Pool::Dlmm(pool) => &pool.base_mint,
             Pool::Whirlpool(pool) => &pool.base_mint,
@@ -122,6 +126,7 @@ impl PoolData for Pool {
     fn get_dex_name(&self) -> &str {
         match self {
             Pool::Raydium(_) => "Raydium",
+            Pool::RaydiumCp(_) => "RaydiumCp",
             Pool::Pump(_) => "Pump",
             Pool::Dlmm(_) => "DLMM",
             Pool::Whirlpool(_) => "Whirlpool",
@@ -443,15 +448,17 @@ impl MintPoolData {
         pool: &str,
         token_vault: &str,
         sol_vault: &str,
-        amm_config: &str,
-        observation: &str,
+        _amm_config: &str,
+        _observation: &str,
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.pools.push(Pool::Raydium(RaydiumPool { // Changed to RaydiumPool for now
+        self.pools.push(Pool::RaydiumCp(RaydiumCpPool {
             pool: Pubkey::from_str(pool)?,
             token_vault: Pubkey::from_str(token_vault)?,
             sol_vault: Pubkey::from_str(sol_vault)?,
+            amm_config: Pubkey::from_str(_amm_config)?,
+            observation: Pubkey::from_str(_observation)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
         }));

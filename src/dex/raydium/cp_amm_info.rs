@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -28,6 +29,7 @@ pub struct RaydiumCpAmmInfo {
 }
 
 impl RaydiumCpAmmInfo {
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 8 + 32 * 10 + 5 + 8 * 5 {
             return Err(anyhow!("Data too short for RaydiumCpAmmInfo: {} bytes", data.len()));

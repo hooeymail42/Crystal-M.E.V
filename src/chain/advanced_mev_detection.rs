@@ -1,5 +1,5 @@
+#![allow(dead_code)]
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use chrono::Utc;

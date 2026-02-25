@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-use crate::chain::pools::{MintPoolData, Pool, PoolData};
+use crate::chain::pools::{MintPoolData, PoolData};
 use crate::dex::raydium::amm_info::RaydiumAmmInfo;
 use crate::dex::raydium::cp_amm_info::RaydiumCpAmmInfo;
 use crate::dex::raydium::clmm_info::RaydiumClmmInfo;
@@ -192,6 +193,7 @@ pub struct PoolRefreshManager {
     reserves: HashMap<Pubkey, PoolReserves>,
     pool_states: HashMap<Pubkey, DeserializedPoolState>,
     serum_markets: HashMap<Pubkey, SerumMarketState>,
+    refresh_count: u64,
 }
 
 impl PoolRefreshManager {
@@ -201,6 +203,7 @@ impl PoolRefreshManager {
             reserves: HashMap::new(),
             pool_states: HashMap::new(),
             serum_markets: HashMap::new(),
+            refresh_count: 0,
         }
     }
 
@@ -461,37 +464,89 @@ impl PoolRefreshManager {
 
     /// Refresh vault token balances for all pools
     pub fn refresh_vault_balances(&mut self, pool_data: &MintPoolData) -> Result<usize> {
+        self.refresh_count += 1;
+        // Only log diagnostics on first refresh and every 500 refreshes to reduce noise
+        let should_log_diag = self.refresh_count == 1 || self.refresh_count % 500 == 0;
         let mut vault_addresses: Vec<Pubkey> = Vec::new();
         let mut vault_to_pool: Vec<(Pubkey, bool)> = Vec::new();
 
         for pool in &pool_data.pools {
             let pool_addr = *pool.pool_address();
 
-            // Use deserialized state for vault addresses if available, otherwise use pool struct
+            // MeteoraDAmmV2 a_vault/b_vault are Meteora vault program accounts, NOT SPL token
+            // accounts. Reading them as SPL token accounts (offset 64) returns garbage bytes
+            // that produce wildly incorrect reserve values and phantom arb opportunities.
+            // Skip vault balance fetching entirely — reserves stay 0 and the pool is filtered
+            // out by the opportunity detector until proper DAMM V2 balance reading is added.
+            if pool.get_dex_name() == "MeteoraDAmmV2" {
+                continue;
+            }
+
+            // SOL mint address used to determine which vault is the SOL side
+            let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+
+            // Use deserialized state for vault addresses if available, otherwise use pool struct.
+            // For CLMM/Whirlpool pools the ordering of vault_0/vault_1 (or vault_a/vault_b)
+            // depends on which mint was registered first on-chain. We check the mint addresses
+            // from the deserialized state so that (token_vault, sol_vault) is always correct.
             let (token_vault, sol_vault) = match self.pool_states.get(&pool_addr) {
-                Some(DeserializedPoolState::RaydiumAmm { coin_vault, pc_vault, .. }) => {
-                    (*coin_vault, *pc_vault)
+                Some(DeserializedPoolState::RaydiumAmm { coin_vault, pc_vault, coin_mint, .. }) => {
+                    // Raydium V4: coin/pc ordering is not standardised — coin may be SOL or token.
+                    // Always put token_vault first, sol_vault second.
+                    if *coin_mint == sol_mint {
+                        (*pc_vault, *coin_vault) // coin=SOL → token_vault=pc, sol_vault=coin
+                    } else {
+                        (*coin_vault, *pc_vault) // coin=token → token_vault=coin, sol_vault=pc
+                    }
                 }
-                Some(DeserializedPoolState::RaydiumCpAmm { vault_0, vault_1, .. }) => {
-                    (*vault_0, *vault_1)
+                Some(DeserializedPoolState::RaydiumCpAmm { vault_0, vault_1, mint_0, .. }) => {
+                    // mint_0 is token_0; if it's SOL then vault_0=sol, vault_1=token
+                    if *mint_0 == sol_mint {
+                        (*vault_1, *vault_0)
+                    } else {
+                        (*vault_0, *vault_1)
+                    }
                 }
-                Some(DeserializedPoolState::RaydiumClmm { vault_0, vault_1, .. }) => {
-                    (*vault_0, *vault_1)
+                Some(DeserializedPoolState::RaydiumClmm { vault_0, vault_1, mint_0, .. }) => {
+                    // Same ordering logic for Raydium CLMM
+                    if *mint_0 == sol_mint {
+                        (*vault_1, *vault_0) // vault_1 = token, vault_0 = SOL
+                    } else {
+                        (*vault_0, *vault_1) // vault_0 = token, vault_1 = SOL
+                    }
                 }
-                Some(DeserializedPoolState::MeteoraDlmm { reserve_x_vault, reserve_y_vault, .. }) => {
-                    (*reserve_x_vault, *reserve_y_vault)
+                Some(DeserializedPoolState::MeteoraDlmm { reserve_x_vault, reserve_y_vault, token_x_mint, token_y_mint, .. }) => {
+                    // Skip non-SOL pairs (e.g., USDC/USDT) — neither token is WSOL
+                    if *token_x_mint != sol_mint && *token_y_mint != sol_mint {
+                        continue;
+                    }
+                    if *token_x_mint == sol_mint {
+                        (*reserve_y_vault, *reserve_x_vault)
+                    } else {
+                        (*reserve_x_vault, *reserve_y_vault)
+                    }
                 }
-                Some(DeserializedPoolState::MeteoraDAmmV2 { a_vault, b_vault, .. }) => {
-                    (*a_vault, *b_vault)
+                Some(DeserializedPoolState::WhirlpoolState { vault_a, vault_b, mint_a, .. }) => {
+                    // Whirlpool: mint_a / mint_b — check which is SOL
+                    if *mint_a == sol_mint {
+                        (*vault_b, *vault_a) // vault_b = token, vault_a = SOL
+                    } else {
+                        (*vault_a, *vault_b) // vault_a = token, vault_b = SOL
+                    }
                 }
-                Some(DeserializedPoolState::WhirlpoolState { vault_a, vault_b, .. }) => {
-                    (*vault_a, *vault_b)
+                Some(DeserializedPoolState::Phoenix { base_vault, quote_vault, base_mint, .. }) => {
+                    if *base_mint == sol_mint {
+                        (*quote_vault, *base_vault)
+                    } else {
+                        (*base_vault, *quote_vault)
+                    }
                 }
-                Some(DeserializedPoolState::Phoenix { base_vault, quote_vault, .. }) => {
-                    (*base_vault, *quote_vault)
-                }
-                Some(DeserializedPoolState::Lifinity { token_a_vault, token_b_vault, .. }) => {
-                    (*token_a_vault, *token_b_vault)
+                Some(DeserializedPoolState::Lifinity { token_a_vault, token_b_vault, token_a_mint, .. }) => {
+                    if *token_a_mint == sol_mint {
+                        (*token_b_vault, *token_a_vault)
+                    } else {
+                        (*token_a_vault, *token_b_vault)
+                    }
                 }
                 Some(DeserializedPoolState::Heaven { .. }) => {
                     // Heaven uses virtual reserves from deserialized state, fallback to pool struct vaults
@@ -505,7 +560,10 @@ impl PoolRefreshManager {
                 }
             };
 
-            // Vault addresses extracted from deserialized state
+            if should_log_diag {
+                info!("[VaultDiag] pool={} dex={} token_vault={} sol_vault={}",
+                    pool_addr, pool.get_dex_name(), token_vault, sol_vault);
+            }
 
             vault_addresses.push(token_vault);
             vault_to_pool.push((pool_addr, true));
@@ -555,6 +613,17 @@ impl PoolRefreshManager {
                     entry.token_reserve = balance;
                 } else {
                     entry.sol_reserve = balance;
+                }
+            }
+        }
+
+        // Log final reserves for diagnostics (throttled)
+        if should_log_diag {
+            for (pool_addr, _) in vault_to_pool.iter().step_by(2) {
+                if let Some(r) = self.reserves.get(pool_addr) {
+                    info!("[ReserveDiag] pool={} token={} sol={} (sol={:.4})",
+                        pool_addr, r.token_reserve, r.sol_reserve,
+                        r.sol_reserve as f64 / 1e9);
                 }
             }
         }

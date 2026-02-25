@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Gas fee awareness for MEV bot profitability filtering
 use std::collections::HashMap;
 

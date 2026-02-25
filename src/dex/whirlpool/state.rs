@@ -4,6 +4,7 @@ use std::io::{Error, ErrorKind, Result};
 pub const NUM_REWARDS: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct Whirlpool {
     pub whirlpools_config: Pubkey, // 32
     pub whirlpool_bump: [u8; 1],   // 1
@@ -47,7 +48,8 @@ impl Whirlpool {
     ///   For b->a (price increases): delta_a = L * (1/sqrt_price_current - 1/sqrt_price_new)
     ///
     /// Simplified single-tick-range calculation (accurate when swap doesn't cross ticks).
-    pub fn calculate_swap_a_to_b(&self, amount_a_in: u64, reserve_a: u64, reserve_b: u64) -> WhirlpoolSwapResult {
+    #[allow(dead_code)]
+    pub fn calculate_swap_a_to_b(&self, amount_a_in: u64, _reserve_a: u64, reserve_b: u64) -> WhirlpoolSwapResult {
         if amount_a_in == 0 || self.liquidity == 0 || self.sqrt_price == 0 {
             return WhirlpoolSwapResult::default();
         }
@@ -89,7 +91,8 @@ impl Whirlpool {
     }
 
     /// Calculate swap output for b_to_a direction
-    pub fn calculate_swap_b_to_a(&self, amount_b_in: u64, reserve_a: u64, reserve_b: u64) -> WhirlpoolSwapResult {
+    #[allow(dead_code)]
+    pub fn calculate_swap_b_to_a(&self, amount_b_in: u64, reserve_a: u64, _reserve_b: u64) -> WhirlpoolSwapResult {
         if amount_b_in == 0 || self.liquidity == 0 || self.sqrt_price == 0 {
             return WhirlpoolSwapResult::default();
         }
@@ -123,6 +126,7 @@ impl Whirlpool {
     }
 
     /// Simple constant-product fallback for when we don't have sqrt_price data
+    #[allow(dead_code)]
     pub fn calculate_swap_simple(
         amount_in: u64,
         reserve_in: u64,
@@ -143,6 +147,7 @@ impl Whirlpool {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct WhirlpoolSwapResult {
     pub amount_in: u64,
     pub amount_out: u64,
@@ -159,6 +164,7 @@ pub struct WhirlpoolRewardInfo {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct TickArray {
     pub start_tick_index: i32,
     pub ticks: [Tick; TICK_ARRAY_SIZE],
@@ -166,6 +172,7 @@ pub struct TickArray {
 }
 
 #[derive(Copy, Clone, Default, Debug)]
+#[allow(dead_code)]
 pub struct Tick {
     pub initialized: bool,
     pub liquidity_net: i128,
@@ -176,11 +183,13 @@ pub struct Tick {
 }
 
 impl Tick {
+    #[allow(dead_code)]
     pub fn check_is_valid_start_tick(tick_index: i32, tick_spacing: u16) -> bool {
         tick_index % (tick_spacing as i32 * TICK_ARRAY_SIZE as i32) == 0
     }
 }
 
+#[allow(dead_code)]
 pub const TICK_ARRAY_SIZE: usize = 88;
 
 impl Whirlpool {

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Real slippage calculation based on DEX models and liquidity
 #[derive(Clone, Debug)]
 pub struct SlippageCalculator {

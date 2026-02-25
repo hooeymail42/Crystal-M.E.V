@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -21,6 +22,7 @@ pub struct MeteoraDAmmV2Info {
 }
 
 impl MeteoraDAmmV2Info {
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 8 + 32 * 7 + 1 + 1 + 8 * 2 {
             return Err(anyhow!("Data too short for MeteoraDAmmV2Info: {} bytes", data.len()));

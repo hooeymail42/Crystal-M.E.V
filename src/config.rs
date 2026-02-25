@@ -1,6 +1,6 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]

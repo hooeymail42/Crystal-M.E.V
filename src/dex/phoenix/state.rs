@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -21,6 +22,7 @@ pub struct PhoenixMarketState {
 }
 
 impl PhoenixMarketState {
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
         // 8 (disc) + 32*4 (mints/vaults) + 8*4 (lot sizes etc) + 2 (fee) + 8*4 (bid/ask)
         let min_len = 8 + 32 * 4 + 8 * 4 + 2 + 8 * 4;

@@ -3,7 +3,8 @@ use crate::chain::{
     refresh::{DeserializedPoolState, PoolRefreshManager},
     trading_graph::TradingGraph,
 };
-use tracing::{debug, info};
+use crate::dex::meteora::dlmm_info::{Bin, DlmmSwapCalculator};
+use tracing::{info, warn};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::cmp::Ordering;
@@ -41,6 +42,7 @@ pub struct OpportunityConfig {
     pub min_profit_percent: f64,
     pub min_liquidity_sol: f64,
     pub max_slippage_percent: f64,
+    #[allow(dead_code)]
     pub max_volatility_percent: f64,
 }
 
@@ -57,6 +59,7 @@ impl Default for OpportunityConfig {
 
 pub struct OpportunityDetector<'a> {
     config: OpportunityConfig,
+    #[allow(dead_code)]
     rpc_client: &'a RpcClient,
 }
 
@@ -141,79 +144,60 @@ impl<'a> OpportunityDetector<'a> {
                 let out = (*virtual_token_reserves as u128).saturating_sub(new_token);
                 Some(out as u64)
             }
-            Some(DeserializedPoolState::RaydiumClmm {
-                mint_0, sqrt_price_x64, liquidity, fee_rate, ..
-            }) => {
-                // CLMM tick-based math: determine direction based on which mint is SOL
-                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
-                let is_sol_mint_0 = *mint_0 == sol_mint;
-
-                if *liquidity == 0 || *sqrt_price_x64 == 0 {
-                    return None;
-                }
-
-                // Apply fee (fee_rate is per million)
-                let fee_amount = (sol_amount_in as u128) * (*fee_rate as u128) / 1_000_000;
-                let amount_after_fee = (sol_amount_in as u128).saturating_sub(fee_amount);
-
-                let l = *liquidity;
-                let sqrt_p = *sqrt_price_x64;
-
-                if is_sol_mint_0 {
-                    // SOL is token_0, buying token_1: use 0_to_1 formula
-                    // new_sqrt_price = L * sqrt_price / (L + delta_0 * sqrt_price / 2^64)
-                    let denominator = l + (amount_after_fee * sqrt_p) / (1u128 << 64);
-                    if denominator == 0 { return None; }
-                    let new_sqrt_price = l * sqrt_p / denominator;
-                    // delta_1 = L * (sqrt_price - new_sqrt_price) / 2^64
-                    let delta_out = if sqrt_p > new_sqrt_price {
-                        l * (sqrt_p - new_sqrt_price) / (1u128 << 64)
-                    } else { 0 };
-                    Some(delta_out as u64)
-                } else {
-                    // SOL is token_1, buying token_0: use 1_to_0 formula
-                    // new_sqrt_price = sqrt_price + delta_1 * 2^64 / L
-                    let new_sqrt_price = sqrt_p + (amount_after_fee * (1u128 << 64)) / l;
-                    // delta_0 = L * (new_sqrt_price - sqrt_price) / (sqrt_price * new_sqrt_price / 2^64)
-                    let numerator = l * (new_sqrt_price - sqrt_p);
-                    let denom_factor = (sqrt_p / (1u128 << 32)) * (new_sqrt_price / (1u128 << 32));
-                    let delta_out = if denom_factor > 0 { numerator / denom_factor } else { 0 };
-                    Some(delta_out as u64)
-                }
+            Some(DeserializedPoolState::RaydiumClmm { fee_rate, .. }) => {
+                // Use constant-product approximation with vault balances + exact CLMM fee.
+                // The theoretical CLMM tick-based math requires accurate per-tick liquidity
+                // which we don't reconstruct from on-chain data. Constant-product with real
+                // vault balances is a reliable approximation within a tick range.
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                // fee_rate is per-million; convert to bps (fee_rate/100)
+                let fee_bps = (*fee_rate / 100).min(9999) as u64;
+                let sol_after_fee =
+                    sol_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_sol = sol_reserve as u128 + sol_after_fee;
+                if new_sol == 0 { return None; }
+                let new_token = (sol_reserve as u128) * (token_reserve as u128) / new_sol;
+                Some((token_reserve as u128).saturating_sub(new_token) as u64)
             }
-            Some(DeserializedPoolState::WhirlpoolState {
-                mint_a, sqrt_price, liquidity, fee_rate, ..
-            }) => {
-                // Whirlpool CLMM math using floats
-                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
-                let is_sol_mint_a = *mint_a == sol_mint;
-
-                if *liquidity == 0 || *sqrt_price == 0 {
-                    return None;
-                }
-
-                let sqrt_price_f = *sqrt_price as f64 / (1u128 << 64) as f64;
-                let liquidity_f = *liquidity as f64;
-
-                // fee_rate is in hundredths of bps (parts per million)
-                let fee_amount = (sol_amount_in as u128 * *fee_rate as u128 / 1_000_000) as u64;
-                let amount_after_fee = sol_amount_in.saturating_sub(fee_amount);
-
-                if is_sol_mint_a {
-                    // SOL is token_a, buying token_b: a_to_b
-                    let new_sqrt_price = liquidity_f * sqrt_price_f
-                        / (liquidity_f + amount_after_fee as f64 * sqrt_price_f);
-                    if new_sqrt_price <= 0.0 || new_sqrt_price >= sqrt_price_f {
-                        return None;
-                    }
-                    let delta_b = liquidity_f * (sqrt_price_f - new_sqrt_price);
-                    Some(delta_b as u64)
+            Some(DeserializedPoolState::WhirlpoolState { fee_rate, .. }) => {
+                // Same constant-product approximation for Whirlpool CLMM.
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                let fee_bps = (*fee_rate / 100).min(9999) as u64;
+                let sol_after_fee =
+                    sol_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_sol = sol_reserve as u128 + sol_after_fee;
+                if new_sol == 0 { return None; }
+                let new_token = (sol_reserve as u128) * (token_reserve as u128) / new_sol;
+                Some((token_reserve as u128).saturating_sub(new_token) as u64)
+            }
+            Some(DeserializedPoolState::MeteoraDlmm { active_id, bin_step, base_factor, token_x_mint, .. }) => {
+                // Use bin-based pricing for DLMM — constant-product gives wrong results because
+                // DLMM liquidity is distributed across fixed-price bins, not a continuous curve.
+                let (token_reserve, sol_reserve) = self.get_cached_reserves(pool, refresh_manager)?;
+                let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+                let x_is_sol = *token_x_mint == sol_mint;
+                // reserve_x and reserve_y must match the DLMM X/Y convention
+                let (reserve_x, reserve_y) = if x_is_sol {
+                    (sol_reserve, token_reserve) // X=SOL, Y=token
                 } else {
-                    // SOL is token_b, buying token_a: b_to_a
-                    let new_sqrt_price = sqrt_price_f + amount_after_fee as f64 / liquidity_f;
-                    let delta_a = liquidity_f * (1.0 / sqrt_price_f - 1.0 / new_sqrt_price);
-                    Some(delta_a as u64)
-                }
+                    (token_reserve, sol_reserve) // X=token, Y=SOL
+                };
+                let calc = Self::build_dlmm_calc(*active_id, *bin_step, *base_factor, reserve_x, reserve_y);
+                // Buy = "SOL in, token out"
+                // If X=SOL: spend X to get Y → swap_x_to_y
+                // If Y=SOL: spend Y to get X → swap_y_to_x
+                let result = if x_is_sol {
+                    calc.swap_x_to_y(sol_amount_in)
+                } else {
+                    calc.swap_y_to_x(sol_amount_in)
+                };
+                if result.amount_out == 0 { return None; }
+                // Sanity: DLMM output cannot exceed the actual token reserve.
+                // Uniform bin approximation can over-estimate when pool is severely imbalanced.
+                if result.amount_out > token_reserve { return None; }
+                Some(result.amount_out)
             }
             _ => {
                 // Generic constant-product with fee
@@ -272,73 +256,52 @@ impl<'a> OpportunityDetector<'a> {
                 let fee = sol_out / 100;
                 Some(sol_out.saturating_sub(fee) as u64)
             }
-            Some(DeserializedPoolState::RaydiumClmm {
-                mint_0, sqrt_price_x64, liquidity, fee_rate, ..
-            }) => {
-                // CLMM tick-based math: Token -> SOL (reverse direction)
-                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
-                let is_sol_mint_0 = *mint_0 == sol_mint;
-
-                if *liquidity == 0 || *sqrt_price_x64 == 0 {
-                    return None;
-                }
-
-                let fee_amount = (token_amount_in as u128) * (*fee_rate as u128) / 1_000_000;
-                let amount_after_fee = (token_amount_in as u128).saturating_sub(fee_amount);
-
-                let l = *liquidity;
-                let sqrt_p = *sqrt_price_x64;
-
-                if is_sol_mint_0 {
-                    // SOL is token_0, selling token_1 for SOL: use 1_to_0 formula
-                    let new_sqrt_price = sqrt_p + (amount_after_fee * (1u128 << 64)) / l;
-                    let numerator = l * (new_sqrt_price - sqrt_p);
-                    let denom_factor = (sqrt_p / (1u128 << 32)) * (new_sqrt_price / (1u128 << 32));
-                    let delta_out = if denom_factor > 0 { numerator / denom_factor } else { 0 };
-                    Some(delta_out as u64)
-                } else {
-                    // SOL is token_1, selling token_0 for SOL: use 0_to_1 formula
-                    let denominator = l + (amount_after_fee * sqrt_p) / (1u128 << 64);
-                    if denominator == 0 { return None; }
-                    let new_sqrt_price = l * sqrt_p / denominator;
-                    let delta_out = if sqrt_p > new_sqrt_price {
-                        l * (sqrt_p - new_sqrt_price) / (1u128 << 64)
-                    } else { 0 };
-                    Some(delta_out as u64)
-                }
+            Some(DeserializedPoolState::RaydiumClmm { fee_rate, .. }) => {
+                // Constant-product approximation with vault balances + exact CLMM fee.
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                let fee_bps = (*fee_rate / 100).min(9999) as u64;
+                let token_after_fee =
+                    token_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_token = token_reserve as u128 + token_after_fee;
+                if new_token == 0 { return None; }
+                let new_sol = (token_reserve as u128) * (sol_reserve as u128) / new_token;
+                Some((sol_reserve as u128).saturating_sub(new_sol) as u64)
             }
-            Some(DeserializedPoolState::WhirlpoolState {
-                mint_a, sqrt_price, liquidity, fee_rate, ..
-            }) => {
-                // Whirlpool CLMM math: Token -> SOL (reverse direction)
-                let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().ok()?;
-                let is_sol_mint_a = *mint_a == sol_mint;
-
-                if *liquidity == 0 || *sqrt_price == 0 {
-                    return None;
-                }
-
-                let sqrt_price_f = *sqrt_price as f64 / (1u128 << 64) as f64;
-                let liquidity_f = *liquidity as f64;
-
-                let fee_amount = (token_amount_in as u128 * *fee_rate as u128 / 1_000_000) as u64;
-                let amount_after_fee = token_amount_in.saturating_sub(fee_amount);
-
-                if is_sol_mint_a {
-                    // SOL is token_a, selling token_b for SOL: b_to_a
-                    let new_sqrt_price = sqrt_price_f + amount_after_fee as f64 / liquidity_f;
-                    let delta_a = liquidity_f * (1.0 / sqrt_price_f - 1.0 / new_sqrt_price);
-                    Some(delta_a as u64)
+            Some(DeserializedPoolState::WhirlpoolState { fee_rate, .. }) => {
+                // Constant-product approximation with vault balances + exact Whirlpool fee.
+                let (token_reserve, sol_reserve) =
+                    self.get_cached_reserves(pool, refresh_manager)?;
+                let fee_bps = (*fee_rate / 100).min(9999) as u64;
+                let token_after_fee =
+                    token_amount_in as u128 * (10000 - fee_bps) as u128 / 10000;
+                let new_token = token_reserve as u128 + token_after_fee;
+                if new_token == 0 { return None; }
+                let new_sol = (token_reserve as u128) * (sol_reserve as u128) / new_token;
+                Some((sol_reserve as u128).saturating_sub(new_sol) as u64)
+            }
+            Some(DeserializedPoolState::MeteoraDlmm { active_id, bin_step, base_factor, token_x_mint, .. }) => {
+                let (token_reserve, sol_reserve) = self.get_cached_reserves(pool, refresh_manager)?;
+                let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+                let x_is_sol = *token_x_mint == sol_mint;
+                let (reserve_x, reserve_y) = if x_is_sol {
+                    (sol_reserve, token_reserve)
                 } else {
-                    // SOL is token_b, selling token_a for SOL: a_to_b
-                    let new_sqrt_price = liquidity_f * sqrt_price_f
-                        / (liquidity_f + amount_after_fee as f64 * sqrt_price_f);
-                    if new_sqrt_price <= 0.0 || new_sqrt_price >= sqrt_price_f {
-                        return None;
-                    }
-                    let delta_b = liquidity_f * (sqrt_price_f - new_sqrt_price);
-                    Some(delta_b as u64)
-                }
+                    (token_reserve, sol_reserve)
+                };
+                let calc = Self::build_dlmm_calc(*active_id, *bin_step, *base_factor, reserve_x, reserve_y);
+                // Sell = "token in, SOL out"
+                // If X=SOL: spend Y (token) to get X (SOL) → swap_y_to_x
+                // If Y=SOL: spend X (token) to get Y (SOL) → swap_x_to_y
+                let result = if x_is_sol {
+                    calc.swap_y_to_x(token_amount_in)
+                } else {
+                    calc.swap_x_to_y(token_amount_in)
+                };
+                if result.amount_out == 0 { return None; }
+                // Sanity: DLMM output cannot exceed the actual SOL reserve.
+                if result.amount_out > sol_reserve { return None; }
+                Some(result.amount_out)
             }
             _ => {
                 let (token_reserve, sol_reserve) =
@@ -355,6 +318,43 @@ impl<'a> OpportunityDetector<'a> {
                 let out = (sol_reserve as u128).saturating_sub(new_sol);
                 Some(out as u64)
             }
+        }
+    }
+
+    /// Build a DLMM swap calculator with uniform bin distribution.
+    /// Used when we don't have actual per-bin data (which requires fetching individual bin accounts).
+    fn build_dlmm_calc(
+        active_id: i32,
+        bin_step: u16,
+        base_factor: u16,
+        reserve_x: u64,
+        reserve_y: u64,
+    ) -> DlmmSwapCalculator {
+        let num_bins: i32 = 20;
+        let half_bins = num_bins / 2;
+        let per_bin_x = reserve_x / num_bins as u64;
+        let per_bin_y = reserve_y / num_bins as u64;
+
+        let mut bins = Vec::with_capacity(num_bins as usize);
+        for i in 0..num_bins {
+            let bin_id = active_id - half_bins + i;
+            bins.push(Bin {
+                id: bin_id,
+                // X tokens live in bins at or above the active bin (someone would buy them with Y)
+                amount_x: if bin_id >= active_id { per_bin_x } else { 0 },
+                // Y tokens live in bins at or below the active bin (someone would buy them with X)
+                amount_y: if bin_id <= active_id { per_bin_y } else { 0 },
+                price: DlmmSwapCalculator::get_bin_price(bin_step, bin_id),
+            });
+        }
+
+        DlmmSwapCalculator {
+            active_id,
+            bin_step,
+            base_factor,
+            variable_fee_control: 0,
+            volatility_accumulator: 0,
+            bins,
         }
     }
 
@@ -388,7 +388,8 @@ impl<'a> OpportunityDetector<'a> {
 
         let target = smaller / 50; // 2%
         let min_trade = 10_000_000u64; // 0.01 SOL
-        Some(target.max(min_trade))
+        let max_trade = 5_000_000_000u64; // 5 SOL hard cap — prevents CLMM vault sizes producing absurd inputs
+        Some(target.max(min_trade).min(max_trade))
     }
 
     /// Confidence score (0-100) based on pool characteristics.
@@ -427,6 +428,14 @@ impl<'a> OpportunityDetector<'a> {
         score.clamp(0.0, 100.0) as u8
     }
 
+    /// Whether a pool can produce reliable constant-product quotes.
+    /// CLMM/Whirlpool pools require tick-based math and their vault balances
+    /// are often incorrectly mapped, causing garbage quotes. Exclude them
+    /// until proper on-chain tick data is available.
+    fn is_scannable(pool: &Pool) -> bool {
+        !matches!(pool.get_dex_name(), "RaydiumClmm" | "Whirlpool")
+    }
+
     fn find_two_dex_opportunities(
         &self,
         pool_data: &MintPoolData,
@@ -436,58 +445,33 @@ impl<'a> OpportunityDetector<'a> {
         let pools = &pool_data.pools;
         let token_mint = pool_data.mint.to_string();
 
-        // Log price comparison every 50 iterations for debugging
-        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let should_log = call_num % 50 == 0;
-
-        if should_log {
-            info!("[Arb] Checking {} pools, call #{}", pools.len(), call_num);
-        }
-
         for (i, buy_pool) in pools.iter().enumerate() {
+            if !Self::is_scannable(buy_pool) { continue; }
             for (j, sell_pool) in pools.iter().enumerate() {
                 if i == j {
                     continue;
                 }
+                if !Self::is_scannable(sell_pool) { continue; }
 
                 let input_lamports = match self.optimal_input_lamports(
                     buy_pool, sell_pool, refresh_manager,
                 ) {
                     Some(v) => v,
-                    None => {
-                        if should_log {
-                            info!("[Arb] {} -> {}: SKIP (no liquidity/reserves)",
-                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
-                        }
-                        continue;
-                    }
+                    None => continue,
                 };
 
                 let tokens_received = match self.calculate_buy_quote(
                     buy_pool, input_lamports, refresh_manager,
                 ) {
                     Some(v) if v > 0 => v,
-                    _ => {
-                        if should_log {
-                            info!("[Arb] {} -> {}: SKIP (no buy quote)",
-                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
-                        }
-                        continue;
-                    }
+                    _ => continue,
                 };
 
                 let sol_output = match self.calculate_sell_quote(
                     sell_pool, tokens_received, refresh_manager,
                 ) {
                     Some(v) if v > 0 => v,
-                    _ => {
-                        if should_log {
-                            info!("[Arb] {} -> {}: SKIP (no sell quote)",
-                                buy_pool.get_dex_name(), sell_pool.get_dex_name());
-                        }
-                        continue;
-                    }
+                    _ => continue,
                 };
 
                 let input_sol = input_lamports as f64 / 1e9;
@@ -495,11 +479,10 @@ impl<'a> OpportunityDetector<'a> {
                 let pnl_sol = output_sol - input_sol;
                 let pnl_pct = (pnl_sol / input_sol) * 100.0;
 
-                if should_log {
-                    info!("[Arb] {} -> {}: in={:.4} SOL, out={:.4} SOL, pnl={:.6} SOL ({:.4}%)",
-                        buy_pool.get_dex_name(), sell_pool.get_dex_name(),
-                        input_sol, output_sol, pnl_sol, pnl_pct);
-                }
+                // Always log pairs that produce a real quote (positive or negative)
+                info!("[Scan] {} -> {}: in={:.4} out={:.4} pnl={:+.4} SOL ({:+.2}%)",
+                    buy_pool.get_dex_name(), sell_pool.get_dex_name(),
+                    input_sol, output_sol, pnl_sol, pnl_pct);
 
                 if sol_output <= input_lamports {
                     continue;
@@ -510,6 +493,15 @@ impl<'a> OpportunityDetector<'a> {
                 let profit_pct = pnl_pct;
 
                 if profit_pct < self.config.min_profit_percent {
+                    continue;
+                }
+
+                // Sanity cap: real on-chain arb never exceeds ~50% in a single tx.
+                // Anything higher is a garbage reserve read (e.g. non-SPL vault accounts
+                // misread as SPL token balances). Reject and log so the bug is visible.
+                if profit_pct > 50.0 {
+                    warn!("[Arb] {} -> {}: REJECTED — unrealistic profit {:.2}% (likely corrupt reserves)",
+                        buy_pool.get_dex_name(), sell_pool.get_dex_name(), profit_pct);
                     continue;
                 }
 

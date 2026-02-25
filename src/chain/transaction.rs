@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use rand::Rng;
 use solana_client::rpc_client::RpcClient;
@@ -19,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::chain::opportunity_detector::{ArbitrageOpportunity, PathStep};
 use crate::chain::refresh::{DeserializedPoolState, PoolRefreshManager};
-use crate::dex::raydium::constants::{raydium_amm_program_id, raydium_cp_amm_program_id, raydium_clmm_program_id};
+use crate::dex::raydium::constants::{raydium_amm_program_id, raydium_clmm_program_id};
 use crate::dex::pump::constants::pump_program_id;
 use crate::dex::meteora::constants::{meteora_dlmm_program_id, meteora_damm_v2_program_id};
 use crate::dex::whirlpool::constants::whirlpool_program_id;
@@ -486,7 +487,7 @@ impl TransactionBuilder {
         &self,
         opportunity: &ArbitrageOpportunity,
         refresh_manager: &PoolRefreshManager,
-        user_token_accounts: &std::collections::HashMap<String, Pubkey>,
+        _user_token_accounts: &std::collections::HashMap<String, Pubkey>,
         slippage_bps: u64,
     ) -> Result<Vec<Instruction>> {
         let mut instructions = Vec::new();
@@ -570,7 +571,7 @@ impl TransactionBuilder {
     ) -> Result<Instruction> {
         let program_id = raydium_amm_program_id();
 
-        let (coin_vault, pc_vault, coin_mint, pc_mint,
+        let (coin_vault, pc_vault, coin_mint, _pc_mint,
              amm_open_orders, amm_target_orders,
              serum_market, serum_program_id) = match refresh_manager.get_pool_state(pool_address) {
             Some(DeserializedPoolState::RaydiumAmm {

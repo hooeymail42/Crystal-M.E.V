@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub struct RawAccountUpdate {
 pub struct PoolSubscriptionManager {
     pools: Arc<RwLock<HashMap<Pubkey, PoolStateUpdate>>>,
     update_tx: mpsc::UnboundedSender<PoolStateUpdate>,
+    #[allow(dead_code)]
     update_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PoolStateUpdate>>>,
 }
 

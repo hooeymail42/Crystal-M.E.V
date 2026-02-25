@@ -1,4 +1,6 @@
 pub mod advanced_mev_detection;
+pub mod backrun;
+pub mod yellowstone_stream;
 pub mod capital_manager;
 pub mod constants;
 pub mod cu_estimator;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::pubkey::Pubkey;
@@ -5,6 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use super::constants::vertigo_program_id;
 
 #[derive(Debug, BorshDeserialize, BorshSerialize)]
+#[allow(dead_code)]
 pub struct VertigoPool {
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
@@ -19,6 +21,7 @@ impl VertigoPool {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct VertigoInfo {
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
@@ -74,6 +77,7 @@ impl VertigoInfo {
 }
 
 /// Helper function to derive vault PDA
+#[allow(dead_code)]
 pub fn derive_vault_address(pool: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[pool.as_ref(), mint.as_ref()], &vertigo_program_id())
 }

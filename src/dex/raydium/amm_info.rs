@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -58,12 +59,15 @@ pub struct RaydiumAmmInfo {
 }
 
 impl RaydiumAmmInfo {
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < 744 {
+        if data.len() < 752 {
             return Err(anyhow!("Data too short for RaydiumAmmInfo: {} bytes", data.len()));
         }
 
-        let d = &data[8..]; // skip discriminator
+        // Raydium V4 AMM is NOT Anchor-based — it has NO 8-byte discriminator.
+        // The first byte is the start of the struct (status: u64).
+        let d = data;
         let mut offset = 0;
 
         macro_rules! read_u64 {

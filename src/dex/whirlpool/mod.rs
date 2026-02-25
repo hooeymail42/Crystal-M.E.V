@@ -7,8 +7,10 @@ use crate::dex::whirlpool::constants::{MAX_TICK_INDEX, MIN_TICK_INDEX};
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::pubkey::Pubkey;
 
+#[allow(dead_code)]
 pub type TickArrayStartIndexes = (i32, Option<i32>, Option<i32>);
 
+#[allow(dead_code)]
 pub fn derive_start_tick(curr_tick: i32, tick_spacing: u16) -> i32 {
     let num_of_ticks_in_array = TICK_ARRAY_SIZE as i32 * tick_spacing as i32;
     let rem = curr_tick % num_of_ticks_in_array;
@@ -19,6 +21,7 @@ pub fn derive_start_tick(curr_tick: i32, tick_spacing: u16) -> i32 {
     }
 }
 
+#[allow(dead_code)]
 pub fn derive_first_tick_array_start_tick(curr_tick: i32, tick_spacing: u16, shifted: bool) -> i32 {
     let tick = if shifted {
         curr_tick + tick_spacing as i32
@@ -28,6 +31,7 @@ pub fn derive_first_tick_array_start_tick(curr_tick: i32, tick_spacing: u16, shi
     derive_start_tick(tick, tick_spacing)
 }
 
+#[allow(dead_code)]
 pub fn derive_tick_array_start_indexes(
     curr_tick: i32,
     tick_spacing: u16,
@@ -40,6 +44,7 @@ pub fn derive_tick_array_start_indexes(
     (ta0_start_index, ta1_start_index_opt, ta2_start_index_opt)
 }
 
+#[allow(dead_code)]
 pub fn derive_next_start_tick_in_seq(
     start_tick: i32,
     tick_spacing: u16,
@@ -58,6 +63,7 @@ pub fn derive_next_start_tick_in_seq(
     }
 }
 
+#[allow(dead_code)]
 pub fn get_tick_array_address(
     whirlpool: &Pubkey,
     start_tick_index: i32,
@@ -73,6 +79,7 @@ pub fn get_tick_array_address(
     Pubkey::find_program_address(seeds, program_id).0
 }
 
+#[allow(dead_code)]
 pub fn update_tick_array_accounts_for_onchain(
     whirlpool: &Whirlpool,
     whirlpool_pk: &Pubkey,

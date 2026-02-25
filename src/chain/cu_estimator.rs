@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -11,9 +12,11 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Default CU limit used for simulation (max allowed on Solana)
+#[allow(dead_code)]
 const SIMULATION_CU_LIMIT: u32 = 1_400_000;
 
 /// Buffer multiplier applied on top of actual CU consumed during simulation
+#[allow(dead_code)]
 const DEFAULT_CU_BUFFER_PCT: f64 = 0.15; // 15%
 
 /// Minimum CU to request (avoid too-small values that could fail)
@@ -24,6 +27,7 @@ const MAX_CU_LIMIT: u32 = 1_400_000;
 
 /// Estimates compute units by simulating a transaction with max CU budget,
 /// then reading the actual units consumed from the simulation result.
+#[allow(dead_code)]
 pub struct CuEstimator {
     rpc: Arc<RpcClient>,
     buffer_pct: f64,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -17,6 +18,7 @@ pub struct LifinityAmmInfo {
 }
 
 impl LifinityAmmInfo {
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
         // 8 (disc) + 32*3 (mints) + 32*2 (vaults) + 8*2 (fees) + 32*3 (oracles)
         let min_len = 8 + 32 * 3 + 32 * 2 + 8 * 2 + 32 * 3;

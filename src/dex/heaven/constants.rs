@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};

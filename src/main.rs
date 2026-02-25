@@ -1,10 +1,10 @@
+mod ai;
 mod chain;
 mod config;
 mod dex;
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
@@ -12,9 +12,11 @@ use anyhow::{Result, bail};
 use tracing::{info, warn, error};
 use spl_associated_token_account::get_associated_token_address;
 
+use crate::ai::{TradeMemory, TradeRecord, OpportunityScorer, ScoringFeatures, MarketAnalyzer, AdaptiveParams};
+use chrono::Timelike;
 use crate::config::BotConfig;
 use crate::chain::pools::{MintPoolData, PoolData};
-use crate::chain::opportunity_detector::{OpportunityDetector, OpportunityConfig};
+use crate::chain::opportunity_detector::OpportunityDetector;
 use crate::chain::refresh::PoolRefreshManager;
 use crate::chain::transaction::TransactionBuilder;
 use crate::chain::wallet_integration::WalletConfig;
@@ -24,6 +26,10 @@ use crate::chain::gas_fee::GasFeeConfig;
 use crate::chain::volume_weighted_slippage::VolumeWeightedSlippagePredictor;
 use crate::chain::pool_subscription::{WebSocketPoolSubscriber, RawAccountUpdate, start_websocket_subscriber};
 use crate::chain::capital_manager::CapitalManager;
+use crate::chain::pool_discovery::{PoolDiscovery, PoolDiscoveryConfig};
+use crate::chain::yellowstone_stream::{YellowstoneConfig, start_yellowstone_stream, add_pool_subscriptions};
+use crate::chain::backrun::{BackrunConfig, BackrunDetector, BackrunBundleBuilder};
+use crate::dex::lst::{LstConfig, LstArbitrageScanner};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -116,6 +122,16 @@ async fn main() -> Result<()> {
         capital_manager.print_summary();
     }
 
+    // ── AI / ML engine ────────────────────────────────────────────────────────
+    // Ensure data/ directory exists for persistence files
+    let _ = std::fs::create_dir_all("data");
+    let mut trade_memory = TradeMemory::load();
+    let mut scorer = OpportunityScorer::load();
+    let mut market_analyzer = MarketAnalyzer::new();
+    let mut adaptive_params = AdaptiveParams::load();
+    info!("[AI] Engine loaded: trade_records={} scorer_updates={} adaptation_cycles={}",
+        trade_memory.records.len(), scorer.total_updates, adaptive_params.adaptation_count);
+
     let mut refresh_manager = PoolRefreshManager::new(rpc.clone());
 
     // Load MintPoolData from config
@@ -137,6 +153,20 @@ async fn main() -> Result<()> {
                 SOL_MINT,
             ) {
                 warn!("Failed to add Raydium pool {}: {}", pool_addr, e);
+            }
+        }
+
+        for pool_addr in &mint_config.raydium_cp_pools {
+            if let Err(e) = mpd.add_raydium_cp_pool(
+                pool_addr,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &mint_config.mint.to_string(),
+                SOL_MINT,
+            ) {
+                warn!("Failed to add Raydium CP pool {}: {}", pool_addr, e);
             }
         }
 
@@ -278,6 +308,122 @@ async fn main() -> Result<()> {
         mint_pool_datas.push(mpd);
     }
 
+    // ── Phase 1: Dynamic Pool Discovery ──────────────────────────────────────
+    // Discover pools on-chain via getProgramAccounts; merge with hardcoded .env pools.
+    let discovery_config = PoolDiscoveryConfig::from_env();
+    let mut pool_discovery = PoolDiscovery::new(rpc.clone(), discovery_config);
+
+    if pool_discovery.config.enabled {
+        info!("[PoolDiscovery] Starting initial pool discovery (this may take 10-30s)...");
+        match pool_discovery.discover_all_pools() {
+            Ok(cache) => {
+                info!("[PoolDiscovery] Initial discovery complete: {} pools across {} tokens",
+                    cache.total_pools(), cache.pools_by_token.len());
+                pool_discovery.log_summary();
+
+                // Merge discovered pools into MintPoolData for each configured mint
+                for mpd in &mut mint_pool_datas {
+                    let mint_str = mpd.mint.to_string();
+                    let discovered = pool_discovery.get_pools_for_token(&mint_str);
+                    let mut added = 0usize;
+                    for dp in discovered {
+                        // Skip duplicates already loaded from .env
+                        let already_loaded = mpd.pools.iter().any(|p| p.pool_address() == &dp.address);
+                        if already_loaded {
+                            continue;
+                        }
+                        let added_ok = match dp.dex.as_str() {
+                            "raydium_v4" => mpd.add_raydium_pool(
+                                &dp.address.to_string(),
+                                &dp.token_vault.to_string(),
+                                &dp.sol_vault.to_string(),
+                                &dp.token_mint.to_string(),
+                                SOL_MINT,
+                            ).is_ok(),
+                            "raydium_cp" => mpd.add_raydium_cp_pool(
+                                &dp.address.to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &dp.token_vault.to_string(),
+                                &dp.sol_vault.to_string(),
+                                &dp.token_mint.to_string(),
+                                SOL_MINT,
+                            ).is_ok(),
+                            "whirlpool" => mpd.add_whirlpool_pool(
+                                &dp.address.to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &dp.token_vault.to_string(),
+                                &dp.sol_vault.to_string(),
+                                vec![],
+                                None,
+                                &dp.token_mint.to_string(),
+                                SOL_MINT,
+                            ).is_ok(),
+                            "meteora_dlmm" => mpd.add_dlmm_pool(
+                                &dp.address.to_string(),
+                                &dp.token_vault.to_string(),
+                                &dp.sol_vault.to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                vec![],
+                                None,
+                                &dp.token_mint.to_string(),
+                                SOL_MINT,
+                            ).is_ok(),
+                            "pump" => mpd.add_pump_pool(
+                                &dp.address.to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &dp.token_vault.to_string(),
+                                &dp.sol_vault.to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &Pubkey::new_unique().to_string(),
+                                &dp.token_mint.to_string(),
+                                SOL_MINT,
+                            ).is_ok(),
+                            _ => false,
+                        };
+                        if added_ok {
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        info!("[PoolDiscovery] Added {} discovered pools for mint {}", added, mint_str);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[PoolDiscovery] Initial discovery failed (falling back to .env pools): {}", e);
+            }
+        }
+    } else {
+        info!("[PoolDiscovery] Disabled via POOL_DISCOVERY_ENABLED=false");
+    }
+
+    // ── Background pool re-discovery task ────────────────────────────────────
+    // Re-runs discovery every refresh_interval_minutes to pick up new pools.
+    // Uses a separate RPC clone so it doesn't block the main trading loop.
+    {
+        let bg_rpc = rpc.clone();
+        let bg_config = PoolDiscoveryConfig::from_env();
+        let refresh_secs = bg_config.refresh_interval_minutes * 60;
+        if bg_config.enabled {
+            tokio::spawn(async move {
+                let mut bg_discovery = PoolDiscovery::new(bg_rpc, bg_config);
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
+                    info!("[PoolDiscovery BG] Refreshing pool list...");
+                    match bg_discovery.discover_all_pools() {
+                        Ok(cache) => {
+                            info!("[PoolDiscovery BG] Refresh complete: {} pools", cache.total_pools());
+                        }
+                        Err(e) => {
+                            warn!("[PoolDiscovery BG] Refresh failed: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     // Initialize trade logger
     let trade_logger = TradeLogger::new("trades.csv");
     info!("Trade logger initialized: {}", trade_logger.get_file_path());
@@ -289,12 +435,9 @@ async fn main() -> Result<()> {
     // Initialize volume-weighted slippage predictor
     let slippage_predictor = VolumeWeightedSlippagePredictor::new("Raydium".to_string());
 
-    let opp_config = OpportunityConfig {
-        min_profit_percent: config.min_profit_sol * 100.0,
-        min_liquidity_sol: 1.0,
-        max_slippage_percent: config.max_slippage_pct,
-        max_volatility_percent: 10.0,
-    };
+    // Base config — adaptive_params will tune these each cycle
+    adaptive_params.base_min_profit_pct = config.min_profit_sol * 100.0;
+    adaptive_params.base_max_trade_sol = 5.0;
 
     let slippage_bps = (config.max_slippage_pct * 100.0) as u64; // convert % to bps
 
@@ -336,6 +479,53 @@ async fn main() -> Result<()> {
         info!("WS_URL not configured, WebSocket subscriptions disabled");
     }
 
+    // ── Phase 2: Yellowstone gRPC / WebSocket Streaming ─────────────────────
+    // Start Yellowstone account streaming for lower-latency pool updates.
+    // When YELLOWSTONE_WS_URL is set, real-time updates replace polling for
+    // all subscribed DEX accounts, cutting latency from 300-500ms to 50-100ms.
+    let mut yellowstone_rx = {
+        let mut ys_config = YellowstoneConfig::from_env();
+        // Add all pool addresses from the loaded mint data so we get per-pool
+        // updates even when the WS doesn't support programSubscribe.
+        let all_pool_pubkeys: Vec<Pubkey> = mint_pool_datas.iter()
+            .flat_map(|mpd| mpd.pools.iter().map(|p| *p.pool_address()))
+            .collect();
+        add_pool_subscriptions(&mut ys_config, &all_pool_pubkeys);
+        info!("[Yellowstone] Registered {} pool addresses for streaming", all_pool_pubkeys.len());
+        start_yellowstone_stream(ys_config)
+    };
+
+    // ── Phase 4: LST Arbitrage Scanner ───────────────────────────────────────
+    // Monitors mSOL/JitoSOL/bSOL spreads between DEX prices and protocol rates.
+    // Disabled by default — enable with LST_ARB_ENABLED=true in .env.
+    let lst_config = LstConfig::from_env();
+    let mut lst_scanner = LstArbitrageScanner::new(rpc.clone(), lst_config.clone());
+    if lst_config.enabled {
+        info!("[LST] LST arbitrage scanning enabled (min_spread={:.2}%)", lst_config.min_spread_pct);
+        // Initial state fetch
+        lst_scanner.refresh_state();
+    } else {
+        info!("[LST] LST arbitrage scanning disabled (set LST_ARB_ENABLED=true to enable)");
+    }
+
+    // ── Phase 5: Jito Backrun Detector ───────────────────────────────────────
+    // Detects large DEX swaps from account update streams and logs backrun opportunities.
+    // Disabled by default — enable with BACKRUN_ENABLED=true in .env.
+    let backrun_config = BackrunConfig::from_env();
+    let mut backrun_detector = BackrunDetector::new(backrun_config.clone());
+    let backrun_bundle_builder = BackrunBundleBuilder::new(
+        backrun_config.enabled && config.enable_real_execution,
+        backrun_config.jito_tip_lamports,
+    );
+    if backrun_config.enabled {
+        info!(
+            "[Backrun] Backrun detection enabled (min_swap={:.1} SOL, max_pos={:.1} SOL)",
+            backrun_config.min_swap_sol, backrun_config.max_position_sol
+        );
+    } else {
+        info!("[Backrun] Backrun detection disabled (set BACKRUN_ENABLED=true to enable)");
+    }
+
     let spam_enabled = config.spam_enabled;
     let has_spam_rpcs = !config.spam_rpc_urls.is_empty();
 
@@ -353,10 +543,16 @@ async fn main() -> Result<()> {
     let mut total_executions: u64 = 0;
     let mut consecutive_failures: u32 = 0;
     let mut circuit_breaker_until: Option<tokio::time::Instant> = None;
+    let mut opp_config = adaptive_params.to_opportunity_config();
+    // Track loop timing for congestion detection
+    let mut last_loop_start = tokio::time::Instant::now();
 
     loop {
         interval.tick().await;
         loop_count += 1;
+        let loop_ms = last_loop_start.elapsed().as_millis() as f64;
+        market_analyzer.record_loop_duration_ms(loop_ms);
+        last_loop_start = tokio::time::Instant::now();
 
         // Circuit breaker: if paused, skip this iteration
         if let Some(resume_at) = circuit_breaker_until {
@@ -417,6 +613,58 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── Phase 2: Drain Yellowstone gRPC/WS account updates ───────────────
+        // Yellowstone delivers account data with lower latency than HTTP polling.
+        // Route updates through the PoolRefreshManager exactly like WS updates.
+        if let Some(ref mut ys_rx) = yellowstone_rx {
+            let mut ys_updates = 0u32;
+            while let Ok(update) = ys_rx.try_recv() {
+                // Determine DEX name from known program IDs
+                let dex_name = if let Some(owner) = &update.owner {
+                    match owner.to_string().as_str() {
+                        "675kPX9MHTjS2zt1qfr1NYHuzeLXFQM5p84CmjZrtsm" => "Raydium",
+                        "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" => "RaydiumCp",
+                        "whirLbMiicVdio4KfQ7QV1mKpQ2dB6A8mEy93gVe5t"   => "Whirlpool",
+                        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"  => "DLMM",
+                        "6EF8rQNwhS2q7s7D3F7p4CevG5vQTGSwbDVefyxE7tE"  => "Pump",
+                        _ => "Unknown",
+                    }
+                } else {
+                    "Unknown"
+                };
+                refresh_manager.apply_account_update(
+                    update.pubkey,
+                    dex_name,
+                    &update.data,
+                );
+
+                // ── Phase 5: Backrun detection on every account update ────────
+                if let Some(opp) = backrun_detector.process_update(&update, &refresh_manager) {
+                    backrun_bundle_builder.handle_opportunity(&opp);
+                }
+
+                ys_updates += 1;
+            }
+            if ys_updates > 0 && loop_count % 20 == 0 {
+                info!("[Loop {}] Applied {} Yellowstone account updates", loop_count, ys_updates);
+            }
+        }
+
+        // ── Phase 4: LST state refresh (every 100 loops ~50s at 500ms interval) ──
+        if lst_config.enabled && loop_count % 100 == 0 {
+            lst_scanner.refresh_state();
+            // Run LST spread scan with empty pool rates for now.
+            // When SOL/mSOL pools are configured, pass live quotes here.
+            let lst_opps = lst_scanner.scan(&[], &[]);
+            if !lst_opps.is_empty() {
+                info!("[LST] {} spread opportunities detected this cycle", lst_opps.len());
+                for opp in lst_opps.iter().take(3) {
+                    info!("[LST]  {} — spread={:.3}% est_profit_10sol={:.4}",
+                        opp.description, opp.spread_pct, opp.estimated_profit_sol_10);
+                }
+            }
+        }
+
         // Full refresh: deserialize pool accounts + fetch vault balances
         for mpd in &mint_pool_datas {
             match refresh_manager.refresh_all(mpd) {
@@ -434,6 +682,14 @@ async fn main() -> Result<()> {
         }
 
         // Detect opportunities
+        info!("[Loop {}] Scanning {} mints / {} pools | failures={} | executions={}",
+            loop_count,
+            mint_pool_datas.len(),
+            mint_pool_datas.iter().map(|m| m.pools.len()).sum::<usize>(),
+            consecutive_failures,
+            total_executions,
+        );
+
         for mpd in &mint_pool_datas {
             let mut detector = OpportunityDetector::new(opp_config.clone(), &rpc);
             let opportunities = detector.find_opportunities(mpd, &refresh_manager);
@@ -455,11 +711,42 @@ async fn main() -> Result<()> {
                     );
                 }
 
+                // Record best price ratio for market analysis
+                if let Some(best_opp) = opportunities.first() {
+                    let ratio = best_opp.expected_output_sol / best_opp.input_amount_sol.max(1e-9);
+                    market_analyzer.record_price_ratio(ratio);
+                }
+
                 // Execute best opportunity
                 if let Some(best) = opportunities.first() {
                     let num_hops = best.path.len();
                     let buy_dex = best.path.first().map(|p| p.dex.as_str()).unwrap_or("unknown");
                     let sell_dex = best.path.last().map(|p| p.dex.as_str()).unwrap_or("unknown");
+
+                    // ── AI scoring filter ─────────────────────────────────────
+                    let sol_reserve_est = (best.input_amount_sol * 50.0).min(500.0); // rough estimate
+                    let features = ScoringFeatures {
+                        profit_pct_norm: (best.profit_percent / 20.0).min(1.0),
+                        liquidity_norm: (sol_reserve_est / 500.0).min(1.0),
+                        dex_a_rep: ScoringFeatures::dex_reputation(buy_dex),
+                        dex_b_rep: ScoringFeatures::dex_reputation(sell_dex),
+                        pair_history: trade_memory.pair_win_rate(buy_dex, sell_dex),
+                        hour_score: {
+                            let h = chrono::Utc::now().hour() as u8;
+                            trade_memory.hour_win_rate(h)
+                        },
+                        congestion_score: market_analyzer.congestion_score(),
+                    };
+                    let (passes, ai_score) = scorer.passes(&features);
+                    if !passes && scorer.total_updates > 30 {
+                        info!("[AI] Opportunity rejected by scorer (score={:.3}, threshold={:.3}): {} -> {} profit={:.2}%",
+                            ai_score, scorer.threshold, buy_dex, sell_dex, best.profit_percent);
+                        continue;
+                    }
+                    info!("[AI] Opportunity accepted: score={:.3} {} -> {} profit={:.2}%",
+                        ai_score, buy_dex, sell_dex, best.profit_percent);
+                    // Save features for post-trade update
+                    let saved_features = features.clone();
 
                     // Use gas fee config for cost estimation
                     let mut est_gas_cost = gas_fee_config.estimate_cost_sol(buy_dex, num_hops);
@@ -561,11 +848,31 @@ async fn main() -> Result<()> {
                                                             Ok(sig) => {
                                                                 total_executions += 1;
                                                                 consecutive_failures = 0;
+                                                                let profitable = best.expected_output_sol > best.input_amount_sol;
                                                                 capital_manager.record_trade(
                                                                     (best.input_amount_sol * 1e9) as u64,
                                                                     (best.expected_output_sol * 1e9) as u64,
                                                                     true,
                                                                 );
+                                                                // ── AI learning: success ─────
+                                                                scorer.update(&saved_features, profitable, best.profit_percent);
+                                                                let h = chrono::Utc::now().hour() as u8;
+                                                                trade_memory.record(TradeRecord {
+                                                                    timestamp_utc: chrono::Utc::now().timestamp(),
+                                                                    hour_utc: h,
+                                                                    dex_a: buy_dex.to_string(),
+                                                                    dex_b: sell_dex.to_string(),
+                                                                    token_mint: best.token_mint.clone(),
+                                                                    input_sol: best.input_amount_sol,
+                                                                    output_sol: best.expected_output_sol,
+                                                                    profit_pct: best.profit_percent,
+                                                                    ai_score,
+                                                                    submitted: true,
+                                                                    confirmed: true,
+                                                                    profitable,
+                                                                });
+                                                                trade_memory.save();
+                                                                scorer.save();
                                                                 info!("TX confirmed: {} (total executions: {})", sig, total_executions);
 
                                                                 let trade = ExecutedTrade {
@@ -592,6 +899,25 @@ async fn main() -> Result<()> {
                                                                     0,
                                                                     false,
                                                                 );
+                                                                // ── AI learning: tx failure ──
+                                                                scorer.update(&saved_features, false, 0.0);
+                                                                let h = chrono::Utc::now().hour() as u8;
+                                                                trade_memory.record(TradeRecord {
+                                                                    timestamp_utc: chrono::Utc::now().timestamp(),
+                                                                    hour_utc: h,
+                                                                    dex_a: buy_dex.to_string(),
+                                                                    dex_b: sell_dex.to_string(),
+                                                                    token_mint: best.token_mint.clone(),
+                                                                    input_sol: best.input_amount_sol,
+                                                                    output_sol: 0.0,
+                                                                    profit_pct: 0.0,
+                                                                    ai_score,
+                                                                    submitted: true,
+                                                                    confirmed: false,
+                                                                    profitable: false,
+                                                                });
+                                                                trade_memory.save();
+                                                                scorer.save();
                                                                 warn!("TX send failed (consecutive_failures={}): {}", consecutive_failures, e);
                                                                 if consecutive_failures >= 50 {
                                                                     error!("Circuit breaker: 50 consecutive failures, shutting down");
@@ -678,6 +1004,16 @@ async fn main() -> Result<()> {
             }
             capital_manager.adapt_risk();
             capital_manager.print_summary();
+
+            // ── AI self-update cycle ───────────────────────────────────────
+            let win_rate = trade_memory.overall_win_rate();
+            adaptive_params.adapt(win_rate, &market_analyzer);
+            opp_config = adaptive_params.to_opportunity_config();
+            scorer.adapt_threshold(win_rate);
+            scorer.save();
+            trade_memory.print_summary();
+            scorer.print_status();
+            market_analyzer.print_status();
         }
     }
 }

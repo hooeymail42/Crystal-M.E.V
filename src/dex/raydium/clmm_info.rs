@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Result, anyhow};
 use solana_sdk::pubkey::Pubkey;
 
@@ -41,6 +42,7 @@ impl RaydiumClmmInfo {
     ///   swap_in_amount_token_1(16), swap_out_amount_token_0(16),
     ///   status(1), ...padding..., fund_fees_token_0(8), fund_fees_token_1(8),
     ///   open_time(8), recent_epoch(8), trade_fee_rate(4)...
+    #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 400 {
             return Err(anyhow!("Data too short for RaydiumClmmInfo: {} bytes", data.len()));
