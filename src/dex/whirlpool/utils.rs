@@ -1,5 +1,6 @@
 use solana_sdk::pubkey::Pubkey;
 
+#[allow(dead_code)]
 pub fn update_tick_array_accounts_for_onchain(
     whirlpool: &Pubkey,
     tick_arrays: &mut Vec<Pubkey>,

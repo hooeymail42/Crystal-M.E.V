@@ -1,9 +1,146 @@
+#![allow(dead_code)]
 use crate::{
     chain::constants::SOL_MINT,
-    dex::raydium::{clmm_info::POOL_TICK_ARRAY_BITMAP_SEED, raydium_clmm_program_id},
+    dex::raydium::{POOL_TICK_ARRAY_BITMAP_SEED, raydium_clmm_program_id},
 };
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
+
+pub trait PoolData {
+    fn pool_address(&self) -> &Pubkey;
+    fn token_vault(&self) -> &Pubkey;
+    fn sol_vault(&self) -> &Pubkey;
+    fn token_mint(&self) -> &Pubkey;
+    fn base_mint(&self) -> &Pubkey;
+    fn get_dex_name(&self) -> &str;
+}
+
+#[derive(Debug, Clone)]
+pub enum Pool {
+    Raydium(RaydiumPool),
+    RaydiumCp(RaydiumCpPool),
+    Pump(PumpPool),
+    Dlmm(DlmmPool),
+    Whirlpool(WhirlpoolPool),
+    RaydiumClmm(RaydiumClmmPool),
+    MeteoraDAmm(MeteoraDAmmPool),
+    Solfi(SolfiPool),
+    MeteoraDAmmV2(MeteoraDAmmV2Pool),
+    Vertigo(VertigoPool),
+    Phoenix(PhoenixPool),
+    Lifinity(LifinityPool),
+    Heaven(HeavenPool),
+}
+
+impl PoolData for Pool {
+    fn pool_address(&self) -> &Pubkey {
+        match self {
+            Pool::Raydium(pool) => &pool.pool,
+            Pool::RaydiumCp(pool) => &pool.pool,
+            Pool::Pump(pool) => &pool.pool,
+            Pool::Dlmm(pool) => &pool.pair,
+            Pool::Whirlpool(pool) => &pool.pool,
+            Pool::RaydiumClmm(pool) => &pool.pool,
+            Pool::MeteoraDAmm(pool) => &pool.pool,
+            Pool::Solfi(pool) => &pool.pool,
+            Pool::MeteoraDAmmV2(pool) => &pool.pool,
+            Pool::Vertigo(pool) => &pool.pool,
+            Pool::Phoenix(pool) => &pool.pool,
+            Pool::Lifinity(pool) => &pool.pool,
+            Pool::Heaven(pool) => &pool.pool,
+        }
+    }
+
+    fn token_vault(&self) -> &Pubkey {
+        match self {
+            Pool::Raydium(pool) => &pool.token_vault,
+            Pool::RaydiumCp(pool) => &pool.token_vault,
+            Pool::Pump(pool) => &pool.token_vault,
+            Pool::Dlmm(pool) => &pool.token_vault,
+            Pool::Whirlpool(pool) => &pool.x_vault, // Assuming x_vault is token_vault
+            Pool::RaydiumClmm(pool) => &pool.x_vault,
+            Pool::MeteoraDAmm(pool) => &pool.token_x_vault,
+            Pool::Solfi(pool) => &pool.token_x_vault,
+            Pool::MeteoraDAmmV2(pool) => &pool.token_x_vault,
+            Pool::Vertigo(pool) => &pool.token_x_vault,
+            Pool::Phoenix(pool) => &pool.base_vault,
+            Pool::Lifinity(pool) => &pool.token_a_vault,
+            Pool::Heaven(pool) => &pool.token_x_vault,
+        }
+    }
+
+    fn sol_vault(&self) -> &Pubkey {
+        match self {
+            Pool::Raydium(pool) => &pool.sol_vault,
+            Pool::RaydiumCp(pool) => &pool.sol_vault,
+            Pool::Pump(pool) => &pool.sol_vault,
+            Pool::Dlmm(pool) => &pool.sol_vault,
+            Pool::Whirlpool(pool) => &pool.y_vault, // Assuming y_vault is sol_vault
+            Pool::RaydiumClmm(pool) => &pool.y_vault,
+            Pool::MeteoraDAmm(pool) => &pool.token_sol_vault,
+            Pool::Solfi(pool) => &pool.token_sol_vault,
+            Pool::MeteoraDAmmV2(pool) => &pool.token_sol_vault,
+            Pool::Vertigo(pool) => &pool.token_sol_vault,
+            Pool::Phoenix(pool) => &pool.quote_vault,
+            Pool::Lifinity(pool) => &pool.token_b_vault,
+            Pool::Heaven(pool) => &pool.token_sol_vault,
+        }
+    }
+
+    fn token_mint(&self) -> &Pubkey {
+        match self {
+            Pool::Raydium(pool) => &pool.token_mint,
+            Pool::RaydiumCp(pool) => &pool.token_mint,
+            Pool::Pump(pool) => &pool.token_mint,
+            Pool::Dlmm(pool) => &pool.token_mint,
+            Pool::Whirlpool(pool) => &pool.token_mint,
+            Pool::RaydiumClmm(pool) => &pool.token_mint,
+            Pool::MeteoraDAmm(pool) => &pool.token_mint,
+            Pool::Solfi(pool) => &pool.token_mint,
+            Pool::MeteoraDAmmV2(pool) => &pool.token_mint,
+            Pool::Vertigo(pool) => &pool.token_mint,
+            Pool::Phoenix(pool) => &pool.token_mint,
+            Pool::Lifinity(pool) => &pool.token_mint,
+            Pool::Heaven(pool) => &pool.token_mint,
+        }
+    }
+
+    fn base_mint(&self) -> &Pubkey {
+        match self {
+            Pool::Raydium(pool) => &pool.base_mint,
+            Pool::RaydiumCp(pool) => &pool.base_mint,
+            Pool::Pump(pool) => &pool.base_mint,
+            Pool::Dlmm(pool) => &pool.base_mint,
+            Pool::Whirlpool(pool) => &pool.base_mint,
+            Pool::RaydiumClmm(pool) => &pool.base_mint,
+            Pool::MeteoraDAmm(pool) => &pool.base_mint,
+            Pool::Solfi(pool) => &pool.base_mint,
+            Pool::MeteoraDAmmV2(pool) => &pool.base_mint,
+            Pool::Vertigo(pool) => &pool.base_mint,
+            Pool::Phoenix(pool) => &pool.base_mint,
+            Pool::Lifinity(pool) => &pool.base_mint,
+            Pool::Heaven(pool) => &pool.base_mint,
+        }
+    }
+
+    fn get_dex_name(&self) -> &str {
+        match self {
+            Pool::Raydium(_) => "Raydium",
+            Pool::RaydiumCp(_) => "RaydiumCp",
+            Pool::Pump(_) => "Pump",
+            Pool::Dlmm(_) => "DLMM",
+            Pool::Whirlpool(_) => "Whirlpool",
+            Pool::RaydiumClmm(_) => "RaydiumClmm",
+            Pool::MeteoraDAmm(_) => "MeteoraDAmm",
+            Pool::Solfi(_) => "Solfi",
+            Pool::MeteoraDAmmV2(_) => "MeteoraDAmmV2",
+            Pool::Vertigo(_) => "Vertigo",
+            Pool::Phoenix(_) => "Phoenix",
+            Pool::Lifinity(_) => "Lifinity",
+            Pool::Heaven(_) => "Heaven",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RaydiumPool {
@@ -12,6 +149,15 @@ pub struct RaydiumPool {
     pub sol_vault: Pubkey,
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
+}
+
+impl PoolData for RaydiumPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Raydium" }
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +169,15 @@ pub struct RaydiumCpPool {
     pub observation: Pubkey,
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
+}
+
+impl PoolData for RaydiumCpPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "RaydiumCp" }
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +192,15 @@ pub struct PumpPool {
     pub base_mint: Pubkey,
 }
 
+impl PoolData for PumpPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Pump" }
+}
+
 #[derive(Debug, Clone)]
 pub struct DlmmPool {
     pub pair: Pubkey,
@@ -47,6 +211,15 @@ pub struct DlmmPool {
     pub memo_program: Option<Pubkey>, // For Token 2022 support
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
+}
+
+impl PoolData for DlmmPool {
+    fn pool_address(&self) -> &Pubkey { &self.pair }
+    fn token_vault(&self) -> &Pubkey { &self.token_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "DLMM" }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +234,15 @@ pub struct WhirlpoolPool {
     pub base_mint: Pubkey,
 }
 
+impl PoolData for WhirlpoolPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.y_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Whirlpool" }
+}
+
 #[derive(Debug, Clone)]
 pub struct RaydiumClmmPool {
     pub pool: Pubkey,
@@ -73,6 +255,15 @@ pub struct RaydiumClmmPool {
     pub memo_program: Option<Pubkey>, // For Token 2022 support
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
+}
+
+impl PoolData for RaydiumClmmPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.x_vault } // Assuming x_vault is token_vault
+    fn sol_vault(&self) -> &Pubkey { &self.y_vault } // Assuming y_vault is sol_vault
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "RaydiumClmm" }
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +283,15 @@ pub struct MeteoraDAmmPool {
     pub base_mint: Pubkey,
 }
 
+impl PoolData for MeteoraDAmmPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "MeteoraDAmm" }
+}
+
 #[derive(Debug, Clone)]
 pub struct SolfiPool {
     pub pool: Pubkey,
@@ -101,6 +301,15 @@ pub struct SolfiPool {
     pub base_mint: Pubkey,
 }
 
+impl PoolData for SolfiPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Solfi" }
+}
+
 #[derive(Debug, Clone)]
 pub struct MeteoraDAmmV2Pool {
     pub pool: Pubkey,
@@ -108,6 +317,15 @@ pub struct MeteoraDAmmV2Pool {
     pub token_sol_vault: Pubkey,
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
+}
+
+impl PoolData for MeteoraDAmmV2Pool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "MeteoraDAmmV2" }
 }
 
 #[derive(Debug, Clone)]
@@ -120,22 +338,76 @@ pub struct VertigoPool {
     pub base_mint: Pubkey,
 }
 
+impl PoolData for VertigoPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Vertigo" }
+}
+
 #[derive(Debug, Clone)]
+pub struct PhoenixPool {
+    pub pool: Pubkey,
+    pub base_vault: Pubkey,
+    pub quote_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for PhoenixPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.base_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.quote_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Phoenix" }
+}
+
+#[derive(Debug, Clone)]
+pub struct LifinityPool {
+    pub pool: Pubkey,
+    pub token_a_vault: Pubkey,
+    pub token_b_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for LifinityPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_a_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_b_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Lifinity" }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeavenPool {
+    pub pool: Pubkey,
+    pub token_x_vault: Pubkey,
+    pub token_sol_vault: Pubkey,
+    pub token_mint: Pubkey,
+    pub base_mint: Pubkey,
+}
+
+impl PoolData for HeavenPool {
+    fn pool_address(&self) -> &Pubkey { &self.pool }
+    fn token_vault(&self) -> &Pubkey { &self.token_x_vault }
+    fn sol_vault(&self) -> &Pubkey { &self.token_sol_vault }
+    fn token_mint(&self) -> &Pubkey { &self.token_mint }
+    fn base_mint(&self) -> &Pubkey { &self.base_mint }
+    fn get_dex_name(&self) -> &str { "Heaven" }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MintPoolData {
     pub mint: Pubkey,
     pub token_program: Pubkey, // Support for both Token and Token 2022
     pub wallet_account: Pubkey,
     pub wallet_wsol_account: Pubkey,
-    pub raydium_pools: Vec<RaydiumPool>,
-    pub raydium_cp_pools: Vec<RaydiumCpPool>,
-    pub pump_pools: Vec<PumpPool>,
-    pub dlmm_pairs: Vec<DlmmPool>,
-    pub whirlpool_pools: Vec<WhirlpoolPool>,
-    pub raydium_clmm_pools: Vec<RaydiumClmmPool>,
-    pub meteora_damm_pools: Vec<MeteoraDAmmPool>,
-    pub solfi_pools: Vec<SolfiPool>,
-    pub meteora_damm_v2_pools: Vec<MeteoraDAmmV2Pool>,
-    pub vertigo_pools: Vec<VertigoPool>,
+    pub pools: Vec<Pool>,
 }
 
 impl MintPoolData {
@@ -149,16 +421,7 @@ impl MintPoolData {
             token_program,
             wallet_account: wallet_pk,
             wallet_wsol_account: wallet_wsol_pk,
-            raydium_pools: Vec::new(),
-            raydium_cp_pools: Vec::new(),
-            pump_pools: Vec::new(),
-            dlmm_pairs: Vec::new(),
-            whirlpool_pools: Vec::new(),
-            raydium_clmm_pools: Vec::new(),
-            meteora_damm_pools: Vec::new(),
-            solfi_pools: Vec::new(),
-            meteora_damm_v2_pools: Vec::new(),
-            vertigo_pools: Vec::new(),
+            pools: Vec::new(),
         })
     }
 
@@ -170,13 +433,13 @@ impl MintPoolData {
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.raydium_pools.push(RaydiumPool {
+        self.pools.push(Pool::Raydium(RaydiumPool {
             pool: Pubkey::from_str(pool)?,
             token_vault: Pubkey::from_str(token_vault)?,
             sol_vault: Pubkey::from_str(sol_vault)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -185,20 +448,20 @@ impl MintPoolData {
         pool: &str,
         token_vault: &str,
         sol_vault: &str,
-        amm_config: &str,
-        observation: &str,
+        _amm_config: &str,
+        _observation: &str,
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.raydium_cp_pools.push(RaydiumCpPool {
+        self.pools.push(Pool::RaydiumCp(RaydiumCpPool {
             pool: Pubkey::from_str(pool)?,
             token_vault: Pubkey::from_str(token_vault)?,
             sol_vault: Pubkey::from_str(sol_vault)?,
-            amm_config: Pubkey::from_str(amm_config)?,
-            observation: Pubkey::from_str(observation)?,
+            amm_config: Pubkey::from_str(_amm_config)?,
+            observation: Pubkey::from_str(_observation)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -207,22 +470,22 @@ impl MintPoolData {
         pool: &str,
         token_vault: &str,
         sol_vault: &str,
-        fee_token_wallet: &str,
-        coin_creator_vault_ata: &str,
-        coin_creator_authority: &str,
+        _fee_token_wallet: &str,
+        _coin_creator_vault_ata: &str,
+        _coin_creator_authority: &str,
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.pump_pools.push(PumpPool {
+        self.pools.push(Pool::Pump(PumpPool {
             pool: Pubkey::from_str(pool)?,
             token_vault: Pubkey::from_str(token_vault)?,
             sol_vault: Pubkey::from_str(sol_vault)?,
-            fee_token_wallet: Pubkey::from_str(fee_token_wallet)?,
-            coin_creator_vault_ata: Pubkey::from_str(coin_creator_vault_ata)?,
-            coin_creator_vault_authority: Pubkey::from_str(coin_creator_authority)?,
+            fee_token_wallet: Pubkey::new_unique(),
+            coin_creator_vault_ata: Pubkey::new_unique(),
+            coin_creator_vault_authority: Pubkey::new_unique(),
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -248,7 +511,7 @@ impl MintPoolData {
             None
         };
 
-        self.dlmm_pairs.push(DlmmPool {
+        self.pools.push(Pool::Dlmm(DlmmPool {
             pair: Pubkey::from_str(pair)?,
             token_vault: Pubkey::from_str(token_vault)?,
             sol_vault: Pubkey::from_str(sol_vault)?,
@@ -257,7 +520,7 @@ impl MintPoolData {
             memo_program: memo_program_pubkey,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -283,7 +546,7 @@ impl MintPoolData {
             None
         };
 
-        self.whirlpool_pools.push(WhirlpoolPool {
+        self.pools.push(Pool::Whirlpool(WhirlpoolPool {
             pool: Pubkey::from_str(pool)?,
             oracle: Pubkey::from_str(oracle)?,
             x_vault: Pubkey::from_str(x_vault)?,
@@ -292,7 +555,7 @@ impl MintPoolData {
             memo_program: memo_program_pubkey,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -328,7 +591,7 @@ impl MintPoolData {
             None
         };
 
-        self.raydium_clmm_pools.push(RaydiumClmmPool {
+        self.pools.push(Pool::RaydiumClmm(RaydiumClmmPool {
             pool: pool_pubkey,
             amm_config: Pubkey::from_str(amm_config)?,
             observation_state: Pubkey::from_str(observation_state)?,
@@ -339,7 +602,7 @@ impl MintPoolData {
             memo_program: memo_program_pubkey,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -359,7 +622,7 @@ impl MintPoolData {
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.meteora_damm_pools.push(MeteoraDAmmPool {
+        self.pools.push(Pool::MeteoraDAmm(MeteoraDAmmPool {
             pool: Pubkey::from_str(pool)?,
             token_x_vault: Pubkey::from_str(token_x_vault)?,
             token_sol_vault: Pubkey::from_str(token_sol_vault)?,
@@ -373,7 +636,7 @@ impl MintPoolData {
             admin_token_fee_sol: Pubkey::from_str(admin_token_fee_sol)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -385,13 +648,13 @@ impl MintPoolData {
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.solfi_pools.push(SolfiPool {
+        self.pools.push(Pool::Solfi(SolfiPool {
             pool: Pubkey::from_str(pool)?,
             token_x_vault: Pubkey::from_str(token_x_vault)?,
             token_sol_vault: Pubkey::from_str(token_sol_vault)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -403,13 +666,13 @@ impl MintPoolData {
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.meteora_damm_v2_pools.push(MeteoraDAmmV2Pool {
+        self.pools.push(Pool::MeteoraDAmmV2(MeteoraDAmmV2Pool {
             pool: Pubkey::from_str(pool)?,
             token_x_vault: Pubkey::from_str(token_x_vault)?,
             token_sol_vault: Pubkey::from_str(token_sol_vault)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
         Ok(())
     }
 
@@ -422,14 +685,68 @@ impl MintPoolData {
         token_mint: &str,
         base_mint: &str,
     ) -> anyhow::Result<()> {
-        self.vertigo_pools.push(VertigoPool {
+        self.pools.push(Pool::Vertigo(VertigoPool {
             pool: Pubkey::from_str(pool)?,
             pool_owner: Pubkey::from_str(pool_owner)?,
             token_x_vault: Pubkey::from_str(token_x_vault)?,
             token_sol_vault: Pubkey::from_str(token_sol_vault)?,
             token_mint: Pubkey::from_str(token_mint)?,
             base_mint: Pubkey::from_str(base_mint)?,
-        });
+        }));
+        Ok(())
+    }
+
+    pub fn add_phoenix_pool(
+        &mut self,
+        pool: &str,
+        base_vault: &str,
+        quote_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Phoenix(PhoenixPool {
+            pool: Pubkey::from_str(pool)?,
+            base_vault: Pubkey::from_str(base_vault)?,
+            quote_vault: Pubkey::from_str(quote_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
+        Ok(())
+    }
+
+    pub fn add_lifinity_pool(
+        &mut self,
+        pool: &str,
+        token_a_vault: &str,
+        token_b_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Lifinity(LifinityPool {
+            pool: Pubkey::from_str(pool)?,
+            token_a_vault: Pubkey::from_str(token_a_vault)?,
+            token_b_vault: Pubkey::from_str(token_b_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
+        Ok(())
+    }
+
+    pub fn add_heaven_pool(
+        &mut self,
+        pool: &str,
+        token_x_vault: &str,
+        token_sol_vault: &str,
+        token_mint: &str,
+        base_mint: &str,
+    ) -> anyhow::Result<()> {
+        self.pools.push(Pool::Heaven(HeavenPool {
+            pool: Pubkey::from_str(pool)?,
+            token_x_vault: Pubkey::from_str(token_x_vault)?,
+            token_sol_vault: Pubkey::from_str(token_sol_vault)?,
+            token_mint: Pubkey::from_str(token_mint)?,
+            base_mint: Pubkey::from_str(base_mint)?,
+        }));
         Ok(())
     }
 }
