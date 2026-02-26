@@ -1,5 +1,6 @@
 use solana_mev_bot::{
     chain::{
+        pool_discovery::{PoolDiscovery, PoolDiscoveryConfig},
         token_fetch::{TokenFetchConfig, TokenFetcher},
         token_price::{MarketDataFetcher, PriceMonitor},
     },
@@ -33,14 +34,26 @@ async fn main() {
 
     // Parse wallet private key and derive wallet address
     let wallet_keypair = Keypair::from_base58_string(&config.wallet.private_key);
-    
     let wallet_address = wallet_keypair.pubkey().to_string();
     println!("Wallet address: {}", wallet_address);
 
     // Initialize RPC client
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
-    // Initialize enhanced token fetcher
+    // ── Pool discovery ────────────────────────────────────────────────────────
+    let mut pool_discovery = PoolDiscovery::new(
+        rpc_client.clone(),
+        PoolDiscoveryConfig::default(),
+    );
+
+    println!("\nRunning pool discovery across all DEXs (this may take 15-60 s on public RPC)...");
+    let _ = pool_discovery.discover_all_pools().await.map(|counts| {
+        for (dex, pools) in &counts {
+            println!("  Discovered {} pools on {}", pools.len(), dex);
+        }
+    }).map_err(|e| eprintln!("Pool discovery failed (falling back to hardcoded pools): {}", e));
+
+    // ── Token fetcher ─────────────────────────────────────────────────────────
     let token_fetch_config = TokenFetchConfig {
         max_retries: 3,
         retry_delay_ms: 1000,
@@ -56,22 +69,50 @@ async fn main() {
     let mut market_fetcher = MarketDataFetcher::new(rpc_client.clone());
 
     // Initialize price monitor
-    let mut price_monitor = PriceMonitor::new(rpc_client, 5000, 0.5); // 5 second intervals, 0.5% threshold
+    let mut price_monitor = PriceMonitor::new(rpc_client, 5000, 0.5);
 
-    // Process each mint configuration
+    // ── Per-mint processing ───────────────────────────────────────────────────
     for mint_config in &config.routing.mint_config_list {
         println!("\nProcessing mint: {}", mint_config.mint);
 
-        // Fetch pool data using enhanced token fetcher
+        // Collect discovered pools for this mint, keyed by DEX name.
+        let discovered = pool_discovery.get_pools_for_token(&mint_config.mint);
+
+        // Merge hardcoded + discovered pool addresses, deduplicating.
+        let merge = |hardcoded: Option<&Vec<String>>, dex: &str| -> Option<Vec<String>> {
+            let mut pools: Vec<String> = hardcoded.cloned().unwrap_or_default();
+            for p in discovered.iter().filter(|p| p.dex == dex) {
+                if !pools.contains(&p.address) {
+                    pools.push(p.address.clone());
+                }
+            }
+            if pools.is_empty() { None } else { Some(pools) }
+        };
+
+        let raydium_pools     = merge(mint_config.raydium_pool_list.as_ref(),      "raydium_v4");
+        let raydium_cp_pools  = merge(mint_config.raydium_cp_pool_list.as_ref(),   "raydium_cp");
+        let pump_pools        = merge(mint_config.pump_pool_list.as_ref(),          "pump");
+        let dlmm_pools        = merge(mint_config.meteora_dlmm_pool_list.as_ref(), "meteora_dlmm");
+        let whirlpool_pools   = merge(mint_config.whirlpool_pool_list.as_ref(),     "whirlpool");
+
+        println!(
+            "  Pool counts → raydium_v4: {}, raydium_cp: {}, pump: {}, dlmm: {}, whirlpool: {}",
+            raydium_pools.as_ref().map_or(0, |v| v.len()),
+            raydium_cp_pools.as_ref().map_or(0, |v| v.len()),
+            pump_pools.as_ref().map_or(0, |v| v.len()),
+            dlmm_pools.as_ref().map_or(0, |v| v.len()),
+            whirlpool_pools.as_ref().map_or(0, |v| v.len()),
+        );
+
         match token_fetcher
             .initialize_pool_data(
                 &mint_config.mint,
-                &wallet_address, // Use derived wallet address
-                mint_config.raydium_pool_list.as_ref(),
-                mint_config.raydium_cp_pool_list.as_ref(),
-                mint_config.pump_pool_list.as_ref(),
-                mint_config.meteora_dlmm_pool_list.as_ref(),
-                mint_config.whirlpool_pool_list.as_ref(),
+                &wallet_address,
+                raydium_pools.as_ref(),
+                raydium_cp_pools.as_ref(),
+                pump_pools.as_ref(),
+                dlmm_pools.as_ref(),
+                whirlpool_pools.as_ref(),
                 mint_config.raydium_clmm_pool_list.as_ref(),
                 mint_config.meteora_damm_pool_list.as_ref(),
                 mint_config.solfi_pool_list.as_ref(),
@@ -94,9 +135,7 @@ async fn main() {
                             price.price_usd, price.price_sol, price.source
                         );
                     }
-                    Err(e) => {
-                        println!("Failed to fetch token price: {}", e);
-                    }
+                    Err(e) => println!("Failed to fetch token price: {}", e),
                 }
 
                 // Calculate arbitrage opportunities
@@ -123,9 +162,7 @@ async fn main() {
                             }
                         }
                     }
-                    Err(e) => {
-                        println!("Failed to calculate arbitrage opportunities: {}", e);
-                    }
+                    Err(e) => println!("Failed to calculate arbitrage opportunities: {}", e),
                 }
             }
             Err(e) => {
@@ -134,18 +171,29 @@ async fn main() {
         }
     }
 
-    // Start price monitoring (this would run indefinitely in a real bot)
+    // ── Price monitoring ──────────────────────────────────────────────────────
     println!("\nStarting price monitoring...");
-    let mints: Vec<String> = config
+    let _mints: Vec<String> = config
         .routing
         .mint_config_list
         .iter()
         .map(|mc| mc.mint.clone())
         .collect();
 
-    // Uncomment the following line to start continuous price monitoring
-    // price_monitor.start_monitoring(mints).await;
+    // Uncomment to start continuous price monitoring:
+    // price_monitor.start_monitoring(_mints).await;
 
-    println!("Enhanced token fetch logic demonstration completed!");
-    println!("The bot is now ready for production use with improved error handling, caching, and retry logic.");
+    println!("Bot ready. Pool discovery active ({} total pools discovered).",
+        pool_discovery.get_all_pools().len());
+
+    // Optional: background pool refresh task
+    // let mut pd = pool_discovery;
+    // tokio::spawn(async move {
+    //     loop {
+    //         tokio::time::sleep(tokio::time::Duration::from_secs(
+    //             pd.config.refresh_interval_minutes * 60,
+    //         )).await;
+    //         let _ = pd.discover_all_pools().await;
+    //     }
+    // });
 }
