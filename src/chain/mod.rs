@@ -1,4 +1,5 @@
 pub mod constants;
+pub mod pool_discovery;
 pub mod pools;
 pub mod refresh;
 pub mod transaction;
