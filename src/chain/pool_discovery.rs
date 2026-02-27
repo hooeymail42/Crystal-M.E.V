@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcProgramAccountsConfig, RpcAccountInfoConfig};
 use solana_client::rpc_filter::{RpcFilterType, Memcmp, MemcmpEncodedBytes};
+use solana_account_decoder::UiDataSliceConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::account::Account;
@@ -19,7 +20,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -166,7 +167,11 @@ impl Default for PoolDiscoveryConfig {
             enabled: true,
             min_liquidity_sol: 5.0,
             refresh_interval_minutes: 120,
-            max_pools_per_dex: 500,
+            // 2000 per DEX gives a much larger token universe than 500.
+            // getProgramAccounts returns accounts in arbitrary order so a larger cap
+            // captures more unique token mints. At ~1ms per account parse this adds
+            // roughly 1-3s to startup discovery time per DEX — acceptable at launch.
+            max_pools_per_dex: 2000,
             discovery_dexes: vec![
                 "raydium_v4".to_string(),
                 "raydium_cp".to_string(),
@@ -196,7 +201,7 @@ impl PoolDiscoveryConfig {
         let max_pools_per_dex = std::env::var("POOL_DISCOVERY_MAX_PER_DEX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(500usize);
+            .unwrap_or(2000usize);
 
         let dexes_str = std::env::var("POOL_DISCOVERY_DEXES")
             .unwrap_or_else(|_| "raydium_v4,raydium_cp,whirlpool,meteora_dlmm,pump".to_string());
@@ -299,19 +304,30 @@ impl PoolDiscovery {
 
     // ── Raydium V4 ────────────────────────────────────────────────────────────
 
-    /// Discover Raydium V4 AMM pools via discriminator + size filter.
+    /// Discover Raydium V4 AMM pools via data-size-only filter.
+    ///
+    /// IMPORTANT: Raydium V4 is NOT Anchor-based and has NO 8-byte discriminator.
+    /// The account data starts directly at offset 0 with `status: u64`.
+    /// Using a memcmp discriminator filter returns zero results because the first
+    /// 8 bytes are the pool status field (a small integer like 1, 2, 6, etc.),
+    /// not a sha256-derived discriminator. We filter by exact account size only.
     fn discover_raydium_v4(&mut self) -> Result<usize> {
         let program_id = Pubkey::from_str(RAYDIUM_V4_PROGRAM)?;
-        let accounts = self.get_program_accounts_filtered(
+        // We only need bytes 0..464 to read coin_vault(336), pc_vault(368),
+        // coin_mint(400), pc_mint(432). Full account is 1664 bytes — fetching
+        // only 464 bytes reduces payload by 72% and avoids provider size limits.
+        let accounts = self.get_program_accounts_size_only(
             &program_id,
-            &RAYDIUM_V4_DISCRIMINATOR,
-            Some(RAYDIUM_V4_ACCOUNT_SIZE),
+            RAYDIUM_V4_ACCOUNT_SIZE,
+            464, // coin_mint ends at 432+32=464
         )?;
 
         let max = self.config.max_pools_per_dex;
         let min_liq = self.config.min_liquidity_sol;
         let now_ts = current_ts();
+        let _ = now_ts; // suppress unused warning
         let mut count = 0usize;
+        let mut parse_errors = 0usize;
 
         for (address, account) in accounts.into_iter().take(max) {
             match self.parse_raydium_v4(&address, &account) {
@@ -320,8 +336,7 @@ impl PoolDiscovery {
                         let token_mint_str = pool.token_mint.to_string();
                         let quote_mint_str = pool.quote_mint.to_string();
                         debug!("[RaydiumV4] pool={} token={} quote={}", address, token_mint_str, quote_mint_str);
-                        // Index under token mint (non-SOL side)
-                        let _ = now_ts; // suppress unused warning
+                        // Index under the non-SOL side mint
                         let index_mint = if quote_mint_str == SOL_MINT_STR {
                             token_mint_str.clone()
                         } else if token_mint_str == SOL_MINT_STR {
@@ -335,32 +350,46 @@ impl PoolDiscovery {
                     }
                 }
                 Err(e) => {
-                    debug!("[RaydiumV4] parse error for {}: {}", address, e);
+                    parse_errors += 1;
+                    if parse_errors <= 3 {
+                        warn!("[RaydiumV4] parse error for {}: {}", address, e);
+                    }
                 }
             }
         }
+        info!("[RaydiumV4] parsed {} pools ({} parse errors)", count, parse_errors);
         Ok(count)
     }
 
     /// Parse a Raydium V4 AmmInfo account.
     ///
-    /// Layout (offsets from byte 0, after 8-byte discriminator):
-    ///   8-16   status (u64)
-    ///   ...
-    ///   104-136  coin_mint_address (Pubkey) — "token A"
-    ///   136-168  pc_mint_address (Pubkey)   — "token B"
-    ///   168-200  pool_coin_token_account (Pubkey) — coin vault
-    ///   200-232  pool_pc_token_account (Pubkey)   — pc vault
+    /// Raydium V4 is NOT Anchor-based — there is NO 8-byte discriminator prefix.
+    /// The struct starts at byte 0 with `status: u64`. Offsets are derived from
+    /// the field order in `dex/raydium/amm_info.rs`:
+    ///
+    ///   u64 fields (8 bytes each, 32 total):  0..256  (8×4 groups)
+    ///   u128 fields and mixed u64 (336 total after u128s + u64 gaps):
+    ///     swap_coin_in_amount  u128  at 256
+    ///     swap_pc_out_amount   u128  at 272
+    ///     swap_coin2_pc_fee    u64   at 288
+    ///     swap_pc_in_amount    u128  at 296
+    ///     swap_coin_out_amount u128  at 312
+    ///     swap_pc2_coin_fee    u64   at 328
+    ///   Pubkey fields (32 bytes each) from 336:
+    ///     pool_coin_token_account  at 336  (coin vault)
+    ///     pool_pc_token_account    at 368  (pc vault)
+    ///     coin_mint_address        at 400
+    ///     pc_mint_address          at 432
     fn parse_raydium_v4(&self, address: &Pubkey, account: &Account) -> Result<DiscoveredPool> {
         let data = &account.data;
-        if data.len() < 232 {
-            return Err(anyhow!("account too short: {} bytes", data.len()));
+        if data.len() < 464 {
+            return Err(anyhow!("account too short for V4 AmmInfo: {} bytes (need ≥464)", data.len()));
         }
 
-        let coin_mint = read_pubkey(data, 104)?;
-        let pc_mint = read_pubkey(data, 136)?;
-        let coin_vault = read_pubkey(data, 168)?;
-        let pc_vault = read_pubkey(data, 200)?;
+        let coin_vault = read_pubkey(data, 336)?;
+        let pc_vault   = read_pubkey(data, 368)?;
+        let coin_mint  = read_pubkey(data, 400)?;
+        let pc_mint    = read_pubkey(data, 432)?;
 
         let sol_mint = Pubkey::from_str(SOL_MINT_STR)?;
         let (token_mint, quote_mint, token_vault, sol_vault) = if coin_mint == sol_mint {
@@ -387,11 +416,13 @@ impl PoolDiscovery {
     /// Discover Raydium CP (constant-product) pools.
     fn discover_raydium_cp(&mut self) -> Result<usize> {
         let program_id = Pubkey::from_str(RAYDIUM_CP_PROGRAM)?;
-        // CP PoolState has discriminator at offset 0 and a known compact size
+        // CP PoolState has discriminator at offset 0 and a known compact size.
+        // We only need bytes 0..232 (vaults at 72/104, mints at 168/200).
         let accounts = self.get_program_accounts_filtered(
             &program_id,
             &RAYDIUM_CP_DISCRIMINATOR,
             Some(RAYDIUM_CP_ACCOUNT_SIZE),
+            232, // token_1_mint ends at 200+32=232
         )?;
 
         let max = self.config.max_pools_per_dex;
@@ -466,10 +497,13 @@ impl PoolDiscovery {
     /// Discover Orca Whirlpool CLMM pools.
     fn discover_whirlpool(&mut self) -> Result<usize> {
         let program_id = Pubkey::from_str(WHIRLPOOL_PROGRAM)?;
+        // We need bytes 0..245 to read fee_rate(45), mint_a(101), vault_a(133),
+        // mint_b(181), vault_b(213). token_vault_b ends at 213+32=245.
         let accounts = self.get_program_accounts_filtered(
             &program_id,
             &WHIRLPOOL_DISCRIMINATOR,
             Some(WHIRLPOOL_ACCOUNT_SIZE),
+            245, // token_vault_b ends at 213+32=245
         )?;
 
         let max = self.config.max_pools_per_dex;
@@ -554,10 +588,14 @@ impl PoolDiscovery {
     /// Discover Meteora DLMM LbPair accounts.
     fn discover_meteora_dlmm(&mut self) -> Result<usize> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+        // DLMM account sizes vary (no exact size filter).
+        // Parse reads d=data[8..]; needs up to d[176+32]=d[208] → absolute byte 216.
+        // Fetching 216 bytes is sufficient; 8-byte discriminator + 208 bytes of body.
         let accounts = self.get_program_accounts_filtered(
             &program_id,
             &METEORA_DLMM_DISCRIMINATOR,
             None, // DLMM account sizes vary
+            216,  // 8-byte disc + 208 body bytes needed (reserve_y at d[176..208])
         )?;
 
         let max = self.config.max_pools_per_dex;
@@ -631,8 +669,13 @@ impl PoolDiscovery {
     /// Discover Pump.fun bonding curve accounts.
     fn discover_pump(&mut self) -> Result<usize> {
         let program_id = Pubkey::from_str(PUMP_PROGRAM)?;
-        // Pump.fun uses no Anchor discriminator — filter purely by account size (300 bytes)
-        let accounts = self.get_program_accounts_size_only(&program_id, PUMP_ACCOUNT_SIZE)?;
+        // Pump.fun uses no Anchor discriminator — filter purely by account size (300 bytes).
+        // Parse reads up to byte 97 (complete flag), so fetch 97 bytes.
+        let accounts = self.get_program_accounts_size_only(
+            &program_id,
+            PUMP_ACCOUNT_SIZE,
+            97, // complete flag at byte 96, so we need 97 bytes
+        )?;
 
         let max = self.config.max_pools_per_dex;
         let min_liq = self.config.min_liquidity_sol;
@@ -706,11 +749,20 @@ impl PoolDiscovery {
     // ── RPC Helpers ───────────────────────────────────────────────────────────
 
     /// Fetch program accounts filtered by discriminator (first 8 bytes) and optional exact size.
+    ///
+    /// Uses `dataSlice` to fetch only the first `data_slice_length` bytes of each account.
+    /// This is critical for performance: Raydium V4 has ~70K accounts at 1664 bytes each
+    /// = ~100MB of data. With dataSlice we only fetch the bytes needed to parse mints and
+    /// vaults (~128-250 bytes per account), keeping the response under 10MB.
+    ///
+    /// Most RPC providers (Helius, QuickNode) allow getProgramAccounts with dataSlice even
+    /// when they restrict full-data responses for programs with many accounts.
     fn get_program_accounts_filtered(
         &self,
         program_id: &Pubkey,
         discriminator: &[u8; 8],
         account_size: Option<u64>,
+        data_slice_length: usize,
     ) -> Result<Vec<(Pubkey, Account)>> {
         let mut filters = vec![
             RpcFilterType::Memcmp(Memcmp::new(
@@ -723,44 +775,79 @@ impl PoolDiscovery {
             filters.push(RpcFilterType::DataSize(size));
         }
 
+        info!(
+            "[PoolDiscovery] getProgramAccounts program={} disc={:02x}{:02x}{:02x}{:02x}... size_filter={:?} data_slice={}",
+            program_id,
+            discriminator[0], discriminator[1], discriminator[2], discriminator[3],
+            account_size, data_slice_length
+        );
+
         let config = RpcProgramAccountsConfig {
             filters: Some(filters),
             account_config: RpcAccountInfoConfig {
                 commitment: Some(CommitmentConfig::confirmed()),
+                // Only fetch the bytes needed to parse mints and vault addresses.
+                // This reduces response size by 80-95% and avoids provider size limits.
+                data_slice: Some(UiDataSliceConfig {
+                    offset: 0,
+                    length: data_slice_length,
+                }),
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        let result = self
-            .rpc_client
-            .get_program_accounts_with_config(program_id, config)
-            .map_err(|e| anyhow!("getProgramAccounts error for {}: {}", program_id, e))?;
-
-        Ok(result)
+        match self.rpc_client.get_program_accounts_with_config(program_id, config) {
+            Ok(result) => {
+                info!("[PoolDiscovery] getProgramAccounts for {} returned {} raw accounts", program_id, result.len());
+                Ok(result)
+            }
+            Err(e) => {
+                // Log the FULL error including the RPC error message so we can diagnose
+                // provider-specific restrictions (e.g. "getProgramAccounts is disabled").
+                warn!("[PoolDiscovery] getProgramAccounts FAILED for {}: {}", program_id, e);
+                Err(anyhow!("getProgramAccounts error for {}: {}", program_id, e))
+            }
+        }
     }
 
     /// Fetch program accounts filtered only by data size (for non-Anchor programs like Pump.fun).
+    ///
+    /// Uses `dataSlice` to fetch only the first `data_slice_length` bytes per account.
     fn get_program_accounts_size_only(
         &self,
         program_id: &Pubkey,
         account_size: u64,
+        data_slice_length: usize,
     ) -> Result<Vec<(Pubkey, Account)>> {
+        info!(
+            "[PoolDiscovery] getProgramAccounts(size-only) program={} size={} data_slice={}",
+            program_id, account_size, data_slice_length
+        );
+
         let config = RpcProgramAccountsConfig {
             filters: Some(vec![RpcFilterType::DataSize(account_size)]),
             account_config: RpcAccountInfoConfig {
                 commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: Some(UiDataSliceConfig {
+                    offset: 0,
+                    length: data_slice_length,
+                }),
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        let result = self
-            .rpc_client
-            .get_program_accounts_with_config(program_id, config)
-            .map_err(|e| anyhow!("getProgramAccounts(size-only) error for {}: {}", program_id, e))?;
-
-        Ok(result)
+        match self.rpc_client.get_program_accounts_with_config(program_id, config) {
+            Ok(result) => {
+                info!("[PoolDiscovery] getProgramAccounts(size-only) for {} returned {} raw accounts", program_id, result.len());
+                Ok(result)
+            }
+            Err(e) => {
+                warn!("[PoolDiscovery] getProgramAccounts(size-only) FAILED for {}: {}", program_id, e);
+                Err(anyhow!("getProgramAccounts(size-only) error for {}: {}", program_id, e))
+            }
+        }
     }
 
     // ── Public Query Methods ──────────────────────────────────────────────────
@@ -891,7 +978,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.min_liquidity_sol, 5.0);
         assert_eq!(config.refresh_interval_minutes, 120);
-        assert_eq!(config.max_pools_per_dex, 500);
+        assert_eq!(config.max_pools_per_dex, 2000);
     }
 
     #[test]

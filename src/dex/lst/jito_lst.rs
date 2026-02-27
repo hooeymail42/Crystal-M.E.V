@@ -26,7 +26,7 @@ use tracing::debug;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Jito stake pool address (mainnet).
-pub const JITO_STAKE_POOL: &str = "Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Posko";
+pub const JITO_STAKE_POOL: &str = "Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb";
 
 /// JitoSOL mint address.
 pub const JITO_SOL_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
