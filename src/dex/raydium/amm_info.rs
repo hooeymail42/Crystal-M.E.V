@@ -61,8 +61,11 @@ pub struct RaydiumAmmInfo {
 impl RaydiumAmmInfo {
     #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < 752 {
-            return Err(anyhow!("Data too short for RaydiumAmmInfo: {} bytes", data.len()));
+        // Raydium V4 AMM accounts are exactly 1664 bytes. Reject wrong-size accounts
+        // so pools from other programs (e.g. 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8)
+        // that happen to be 752 bytes don't get deserialized as garbage RaydiumAmm state.
+        if data.len() < 1664 {
+            return Err(anyhow!("Data too short for RaydiumAmmInfo: {} bytes (expected ≥1664)", data.len()));
         }
 
         // Raydium V4 AMM is NOT Anchor-based — it has NO 8-byte discriminator.

@@ -54,7 +54,7 @@ impl Default for GasFeeConfig {
         multipliers.insert("Heaven".to_string(), 1.3);
 
         Self {
-            min_profit_to_execute_sol: 0.005,      // OPTIMIZED: 0.5 cents minimum (aggressive)
+            min_profit_to_execute_sol: 0.0001,      // Default: require at least 0.1 mSOL profit (overridden by MIN_PROFIT_SOL env var)
             safety_margin_percent: 0.10,           // OPTIMIZED: 10% margin (down from 20%)
             dex_fee_multipliers: multipliers,
             aggressive_mode: true,                  // OPTIMIZED: Enable aggressive execution

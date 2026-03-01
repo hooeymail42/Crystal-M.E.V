@@ -30,6 +30,7 @@ pub struct BotConfig {
     pub fee_percentile: usize,
     pub alt_addresses: Vec<String>,
     pub mints: Vec<MintConfig>,
+    pub per_leg_slippage_bps: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +164,11 @@ impl BotConfig {
 
         let mints = Self::load_mints()?;
 
+        let per_leg_slippage_bps = std::env::var("PER_LEG_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30u16);
+
         Ok(Self {
             rpc_url,
             ws_url,
@@ -189,13 +195,14 @@ impl BotConfig {
             fee_percentile,
             alt_addresses,
             mints,
+            per_leg_slippage_bps,
         })
     }
 
     fn load_mints() -> Result<Vec<MintConfig>> {
         let mut mints = Vec::new();
 
-        for i in 1..=10 {
+        for i in 1..=20 {
             let mint_key = format!("MINT_{}", i);
             if let Ok(mint_str) = std::env::var(&mint_key) {
                 let mint = Pubkey::from_str(&mint_str)

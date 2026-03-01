@@ -5,11 +5,13 @@ mod dex;
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::transaction::Transaction;
+use solana_sdk::signature::Signer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
 use anyhow::{Result, bail};
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 use spl_associated_token_account::get_associated_token_address;
 
 use crate::ai::{TradeMemory, TradeRecord, OpportunityScorer, ScoringFeatures, MarketAnalyzer, AdaptiveParams};
@@ -69,6 +71,52 @@ async fn main() -> Result<()> {
 
     let payer = Arc::new(wallet.keypair);
 
+    // ── Create WSOL ATA at startup ────────────────────────────────────────────
+    // WSOL ATA is needed for flash loan swaps. Create it once; it persists on-chain.
+    let wsol_mint = spl_token::native_mint::id();
+    let wsol_ata = get_associated_token_address(&wallet_address, &wsol_mint);
+
+    match rpc.get_account(&wsol_ata) {
+        Ok(_) => {
+            info!("[Startup] WSOL ATA already exists: {}", wsol_ata);
+        }
+        Err(_) => {
+            info!("[Startup] Creating WSOL ATA...");
+            let create_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &payer.pubkey(),
+                &wallet_address,
+                &wsol_mint,
+                &spl_token::ID,
+            );
+
+            let recent_blockhash = match rpc.get_latest_blockhash() {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("[Startup] Failed to get blockhash for WSOL ATA creation: {}", e);
+                    // Continue anyway; the ATA will be created in the first flash loan tx
+                    return Err(e.into());
+                }
+            };
+
+            let tx = Transaction::new_signed_with_payer(
+                &[create_ata_ix],
+                Some(&payer.pubkey()),
+                &[payer.as_ref()],
+                recent_blockhash,
+            );
+
+            match rpc.send_and_confirm_transaction(&tx) {
+                Ok(sig) => {
+                    info!("[Startup] Created WSOL ATA: {} (tx: {})", wsol_ata, sig);
+                }
+                Err(e) => {
+                    warn!("[Startup] Failed to create WSOL ATA: {} (will retry on first flash loan)", e);
+                    // Non-fatal; flash loan tx will try again
+                }
+            }
+        }
+    }
+
     // Load Address Lookup Tables
     let alt_accounts = if !config.alt_addresses.is_empty() {
         let alt_keys: Vec<Pubkey> = config.alt_addresses.iter()
@@ -80,6 +128,7 @@ async fn main() -> Result<()> {
     };
     info!("Loaded {} Address Lookup Tables", alt_accounts.len());
 
+    let payer_arc = Arc::clone(&payer); // keep a reference for post-init startup tasks (ATA creation)
     let mut tx_builder = TransactionBuilder::new(
         rpc.clone(),
         payer,
@@ -308,92 +357,257 @@ async fn main() -> Result<()> {
         mint_pool_datas.push(mpd);
     }
 
+    // Pre-create the user_token_accounts map early so pool discovery can register
+    // ATAs for newly discovered mints. The WSOL ATA and per-configured-mint ATAs
+    // are registered here; the discovery block adds more entries for new mints.
+    let mut user_token_accounts: HashMap<String, Pubkey> = HashMap::new();
+    let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
+    let wsol_ata = get_associated_token_address(&wallet_address, &sol_mint_pubkey);
+    user_token_accounts.insert(SOL_MINT.to_string(), wsol_ata);
+    info!("WSOL ATA: {}", wsol_ata);
+    for mpd in &mint_pool_datas {
+        let ata = get_associated_token_address(&wallet_address, &mpd.mint);
+        user_token_accounts.insert(mpd.mint.to_string(), ata);
+    }
+
+    // Create token ATAs on-chain for all configured mints.
+    // Uses create_idempotent so this is safe to call even if the ATA already exists.
+    // Without this, swaps fail with AccountNotInitialized when the bot tries to
+    // receive a token it has never held before.
+    {
+        let mints_needing_ata: Vec<Pubkey> = mint_pool_datas.iter()
+            .map(|mpd| mpd.mint)
+            .filter(|mint| {
+                let ata = get_associated_token_address(&wallet_address, mint);
+                rpc.get_account(&ata).is_err()
+            })
+            .collect();
+
+        if !mints_needing_ata.is_empty() {
+            info!("[Startup] Creating {} missing token ATAs...", mints_needing_ata.len());
+            for chunk in mints_needing_ata.chunks(5) {
+                let ixs: Vec<solana_sdk::instruction::Instruction> = chunk.iter().map(|mint| {
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &payer_arc.pubkey(),
+                        &wallet_address,
+                        mint,
+                        &spl_token::ID,
+                    )
+                }).collect();
+                match rpc.get_latest_blockhash() {
+                    Ok(bh) => {
+                        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                            &ixs,
+                            Some(&payer_arc.pubkey()),
+                            &[payer_arc.as_ref()],
+                            bh,
+                        );
+                        match rpc.send_and_confirm_transaction(&tx) {
+                            Ok(sig) => info!("[Startup] Token ATAs created: {}", sig),
+                            Err(e) => warn!("[Startup] ATA creation failed: {}", e),
+                        }
+                    }
+                    Err(e) => warn!("[Startup] Failed to get blockhash for ATA creation: {}", e),
+                }
+            }
+        } else {
+            info!("[Startup] All {} token ATAs already exist on-chain", mint_pool_datas.len());
+        }
+    }
+
     // ── Phase 1: Dynamic Pool Discovery ──────────────────────────────────────
     // Discover pools on-chain via getProgramAccounts; merge with hardcoded .env pools.
+    // Also creates NEW MintPoolData entries for tokens found on-chain that are not in .env,
+    // so the hundreds of discovered pools are actually scanned instead of discarded.
     let discovery_config = PoolDiscoveryConfig::from_env();
     let mut pool_discovery = PoolDiscovery::new(rpc.clone(), discovery_config);
 
+    // Helper closure: add a DiscoveredPool to a MintPoolData by dex type.
+    // Returns true if the pool was added successfully.
+    let add_discovered_pool = |mpd: &mut MintPoolData, dp: &crate::chain::pool_discovery::DiscoveredPool| -> bool {
+        match dp.dex.as_str() {
+            "raydium_v4" => mpd.add_raydium_pool(
+                &dp.address.to_string(),
+                &dp.token_vault.to_string(),
+                &dp.sol_vault.to_string(),
+                &dp.token_mint.to_string(),
+                SOL_MINT,
+            ).is_ok(),
+            "raydium_cp" => mpd.add_raydium_cp_pool(
+                &dp.address.to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &dp.token_vault.to_string(),
+                &dp.sol_vault.to_string(),
+                &dp.token_mint.to_string(),
+                SOL_MINT,
+            ).is_ok(),
+            "whirlpool" => mpd.add_whirlpool_pool(
+                &dp.address.to_string(),
+                &Pubkey::new_unique().to_string(),
+                &dp.token_vault.to_string(),
+                &dp.sol_vault.to_string(),
+                vec![],
+                None,
+                &dp.token_mint.to_string(),
+                SOL_MINT,
+            ).is_ok(),
+            "meteora_dlmm" => mpd.add_dlmm_pool(
+                &dp.address.to_string(),
+                &dp.token_vault.to_string(),
+                &dp.sol_vault.to_string(),
+                &Pubkey::new_unique().to_string(),
+                vec![],
+                None,
+                &dp.token_mint.to_string(),
+                SOL_MINT,
+            ).is_ok(),
+            "pump" => mpd.add_pump_pool(
+                &dp.address.to_string(),
+                &Pubkey::new_unique().to_string(),
+                &dp.token_vault.to_string(),
+                &dp.sol_vault.to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &dp.token_mint.to_string(),
+                SOL_MINT,
+            ).is_ok(),
+            _ => false,
+        }
+    };
+
     if pool_discovery.config.enabled {
         info!("[PoolDiscovery] Starting initial pool discovery (this may take 10-30s)...");
-        match pool_discovery.discover_all_pools() {
-            Ok(cache) => {
-                info!("[PoolDiscovery] Initial discovery complete: {} pools across {} tokens",
-                    cache.total_pools(), cache.pools_by_token.len());
-                pool_discovery.log_summary();
+        // Clone the cache immediately so the &mut borrow on pool_discovery is released.
+        // This lets us call pool_discovery.log_summary() and get_pools_for_token() freely.
+        let discovery_result: Option<crate::chain::pool_discovery::PoolDiscoveryCache> =
+            match pool_discovery.discover_all_pools() {
+                Ok(cache) => {
+                    info!("[PoolDiscovery] Initial discovery complete: {} pools across {} tokens",
+                        cache.total_pools(), cache.pools_by_token.len());
+                    Some(cache.clone())
+                }
+                Err(e) => {
+                    warn!("[PoolDiscovery] Initial discovery failed (falling back to .env pools): {}", e);
+                    None
+                }
+            };
 
-                // Merge discovered pools into MintPoolData for each configured mint
-                for mpd in &mut mint_pool_datas {
-                    let mint_str = mpd.mint.to_string();
-                    let discovered = pool_discovery.get_pools_for_token(&mint_str);
-                    let mut added = 0usize;
-                    for dp in discovered {
-                        // Skip duplicates already loaded from .env
-                        let already_loaded = mpd.pools.iter().any(|p| p.pool_address() == &dp.address);
-                        if already_loaded {
-                            continue;
-                        }
-                        let added_ok = match dp.dex.as_str() {
-                            "raydium_v4" => mpd.add_raydium_pool(
-                                &dp.address.to_string(),
-                                &dp.token_vault.to_string(),
-                                &dp.sol_vault.to_string(),
-                                &dp.token_mint.to_string(),
-                                SOL_MINT,
-                            ).is_ok(),
-                            "raydium_cp" => mpd.add_raydium_cp_pool(
-                                &dp.address.to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &dp.token_vault.to_string(),
-                                &dp.sol_vault.to_string(),
-                                &dp.token_mint.to_string(),
-                                SOL_MINT,
-                            ).is_ok(),
-                            "whirlpool" => mpd.add_whirlpool_pool(
-                                &dp.address.to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &dp.token_vault.to_string(),
-                                &dp.sol_vault.to_string(),
-                                vec![],
-                                None,
-                                &dp.token_mint.to_string(),
-                                SOL_MINT,
-                            ).is_ok(),
-                            "meteora_dlmm" => mpd.add_dlmm_pool(
-                                &dp.address.to_string(),
-                                &dp.token_vault.to_string(),
-                                &dp.sol_vault.to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                vec![],
-                                None,
-                                &dp.token_mint.to_string(),
-                                SOL_MINT,
-                            ).is_ok(),
-                            "pump" => mpd.add_pump_pool(
-                                &dp.address.to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &dp.token_vault.to_string(),
-                                &dp.sol_vault.to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &Pubkey::new_unique().to_string(),
-                                &dp.token_mint.to_string(),
-                                SOL_MINT,
-                            ).is_ok(),
-                            _ => false,
-                        };
-                        if added_ok {
-                            added += 1;
-                        }
+        if let Some(cache) = discovery_result {
+            pool_discovery.log_summary();
+
+            // Pass 1: Merge discovered pools into existing .env MintPoolData entries.
+            for mpd in &mut mint_pool_datas {
+                let mint_str = mpd.mint.to_string();
+                let discovered = pool_discovery.get_pools_for_token(&mint_str);
+                let mut added = 0usize;
+                for dp in discovered {
+                    let already_loaded = mpd.pools.iter().any(|p| p.pool_address() == &dp.address);
+                    if already_loaded {
+                        continue;
                     }
-                    if added > 0 {
-                        info!("[PoolDiscovery] Added {} discovered pools for mint {}", added, mint_str);
+                    if add_discovered_pool(mpd, dp) {
+                        added += 1;
                     }
                 }
+                if added > 0 {
+                    info!("[PoolDiscovery] Added {} discovered pools for existing mint {}", added, mint_str);
+                }
             }
-            Err(e) => {
-                warn!("[PoolDiscovery] Initial discovery failed (falling back to .env pools): {}", e);
+
+            // Pass 2: Create NEW MintPoolData entries for tokens discovered on-chain
+            // that are NOT already in the configured .env mints.
+            // This is the key fix — without this, the 500+ discovered pools are discarded.
+            // Only include tokens that have pools on at least 2 different DEX types
+            // (required for arb) and meaningful liquidity.
+            // Cap at POOL_DISCOVERY_MAX_NEW_MINTS (default 25) to bound startup time.
+            let max_new_mints = std::env::var("POOL_DISCOVERY_MAX_NEW_MINTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(25);
+            let min_liquidity_for_new = std::env::var("POOL_DISCOVERY_MIN_LIQUIDITY_SOL")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(5.0);
+
+            let existing_mints: std::collections::HashSet<String> = mint_pool_datas
+                .iter()
+                .map(|m| m.mint.to_string())
+                .collect();
+
+            // Collect candidate new mints: tokens discovered on-chain that are not already
+            // in the .env configuration and are not SOL itself.
+            // We deliberately allow tokens that only appear in ONE DEX type — a single
+            // discovered pool is still useful because it can arb against .env-configured pools
+            // for the same mint, and the background discovery refresh may find more DEX types
+            // for the same token over time.
+            let sol_mint_str = SOL_MINT.to_string();
+            let mut new_mint_candidates: Vec<(String, Vec<crate::chain::pool_discovery::DiscoveredPool>)> = cache
+                .pools_by_token
+                .iter()
+                .filter(|(mint_str, pools)| {
+                    // Must not already be configured
+                    if existing_mints.contains(*mint_str) { return false; }
+                    // Must not be SOL itself
+                    if **mint_str == sol_mint_str { return false; }
+                    // Must have at least 1 pool (trivially true at this point, but explicit)
+                    if pools.is_empty() { return false; }
+                    // At least one pool must have sufficient liquidity OR have unknown liquidity (0.0)
+                    // Note: all discovered pools have liquidity_sol=0.0 because vault balances are
+                    // not fetched during discovery. The 0.0 check passes everything through here;
+                    // the real liquidity filter happens after first vault balance refresh.
+                    pools.iter().any(|p| p.liquidity_sol >= min_liquidity_for_new || p.liquidity_sol == 0.0)
+                })
+                .map(|(mint_str, pools)| {
+                    // Sort pools by liquidity descending, keep top 10 per token
+                    let mut sorted = pools.clone();
+                    sorted.sort_by(|a, b| b.liquidity_sol.partial_cmp(&a.liquidity_sol)
+                        .unwrap_or(std::cmp::Ordering::Equal));
+                    sorted.truncate(10);
+                    (mint_str.clone(), sorted)
+                })
+                .collect();
+
+                // Sort candidate mints by total liquidity descending to prioritize the most liquid tokens
+                new_mint_candidates.sort_by(|(_, a_pools), (_, b_pools)| {
+                    let a_liq: f64 = a_pools.iter().map(|p| p.liquidity_sol).sum();
+                    let b_liq: f64 = b_pools.iter().map(|p| p.liquidity_sol).sum();
+                    b_liq.partial_cmp(&a_liq).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                new_mint_candidates.truncate(max_new_mints);
+
+                let new_mint_count = new_mint_candidates.len();
+                for (mint_str, discovered_pools) in new_mint_candidates {
+                    match MintPoolData::new(&mint_str, &wallet_address.to_string(), spl_token::id()) {
+                        Ok(mut new_mpd) => {
+                            let mut added = 0usize;
+                            for dp in &discovered_pools {
+                                if add_discovered_pool(&mut new_mpd, dp) {
+                                    added += 1;
+                                }
+                            }
+                            if added >= 1 {
+                                // Register the new token ATA
+                                if let Ok(token_pk) = Pubkey::from_str(&mint_str) {
+                                    let ata = spl_associated_token_account::get_associated_token_address(
+                                        &wallet_address, &token_pk,
+                                    );
+                                    user_token_accounts.insert(mint_str.clone(), ata);
+                                }
+                                info!("[PoolDiscovery] New mint {} — {} pools from discovery", mint_str, added);
+                                mint_pool_datas.push(new_mpd);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[PoolDiscovery] Failed to create MintPoolData for {}: {}", mint_str, e);
+                        }
+                    }
+                }
+            if new_mint_count > 0 {
+                info!("[PoolDiscovery] Added {} new token mints from on-chain discovery (total mints={})",
+                    new_mint_count, mint_pool_datas.len());
             }
-        }
+        } // end if let Some(cache)
     } else {
         info!("[PoolDiscovery] Disabled via POOL_DISCOVERY_ENABLED=false");
     }
@@ -428,8 +642,9 @@ async fn main() -> Result<()> {
     let trade_logger = TradeLogger::new("trades.csv");
     info!("Trade logger initialized: {}", trade_logger.get_file_path());
 
-    // Initialize gas fee config
-    let gas_fee_config = GasFeeConfig::default();
+    // Initialize gas fee config — wire MIN_PROFIT_SOL from .env into the filter
+    let mut gas_fee_config = GasFeeConfig::default();
+    gas_fee_config.min_profit_to_execute_sol = config.min_profit_sol;
     info!("Gas fee config: min_profit={:.4} SOL, aggressive={}", gas_fee_config.min_profit_to_execute_sol, gas_fee_config.aggressive_mode);
 
     // Initialize volume-weighted slippage predictor
@@ -441,19 +656,15 @@ async fn main() -> Result<()> {
 
     let slippage_bps = (config.max_slippage_pct * 100.0) as u64; // convert % to bps
 
-    // Pre-create ATAs for all token mints
-    let mut user_token_accounts: HashMap<String, Pubkey> = HashMap::new();
-    let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
-    let wsol_ata = get_associated_token_address(&wallet_address, &sol_mint_pubkey);
-    user_token_accounts.insert(SOL_MINT.to_string(), wsol_ata);
-    info!("WSOL ATA: {}", wsol_ata);
-
+    // Ensure ATAs are registered for all mints including those added by discovery.
+    // (WSOL + the original .env mints were registered before discovery;
+    //  discovery-added mints registered their ATAs inline above.)
     for mpd in &mint_pool_datas {
-        let ata = get_associated_token_address(&wallet_address, &mpd.mint);
-        user_token_accounts.insert(mpd.mint.to_string(), ata);
-        info!("ATA for mint {}: {}", mpd.mint, ata);
+        user_token_accounts
+            .entry(mpd.mint.to_string())
+            .or_insert_with(|| get_associated_token_address(&wallet_address, &mpd.mint));
     }
-    info!("Pre-derived {} user token accounts", user_token_accounts.len());
+    info!("Pre-derived {} user token accounts (covers all mints incl. discovery)", user_token_accounts.len());
 
     // Start WebSocket pool subscriber if WS URL is configured
     let mut ws_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RawAccountUpdate>> = None;
@@ -543,6 +754,9 @@ async fn main() -> Result<()> {
     let mut total_executions: u64 = 0;
     let mut consecutive_failures: u32 = 0;
     let mut circuit_breaker_until: Option<tokio::time::Instant> = None;
+    // Pool-pair simulation blacklist: prevents retrying pairs that consistently fail simulation.
+    // Key = pool_addresses joined by "-"; value = expiry (std::time::Instant).
+    let mut sim_blacklist: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
     let mut opp_config = adaptive_params.to_opportunity_config();
     // Track loop timing for congestion detection
     let mut last_loop_start = tokio::time::Instant::now();
@@ -554,16 +768,16 @@ async fn main() -> Result<()> {
         market_analyzer.record_loop_duration_ms(loop_ms);
         last_loop_start = tokio::time::Instant::now();
 
-        // Circuit breaker: if paused, skip this iteration
+        // Circuit breaker: if paused, sleep and retry rather than busy-spinning
         if let Some(resume_at) = circuit_breaker_until {
             if tokio::time::Instant::now() < resume_at {
-                if loop_count % 10 == 0 {
-                    warn!("[Circuit Breaker] Trading paused due to {} consecutive failures, waiting...", consecutive_failures);
-                }
+                warn!("[Circuit Breaker] Trading paused due to {} consecutive failures, waiting...", consecutive_failures);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             } else {
                 info!("[Circuit Breaker] Pause period ended, resuming trading");
                 circuit_breaker_until = None;
+                consecutive_failures = 0;
             }
         }
 
@@ -719,6 +933,17 @@ async fn main() -> Result<()> {
 
                 // Execute best opportunity
                 if let Some(best) = opportunities.first() {
+                    // Simulation blacklist: skip pairs that recently failed simulation to prevent
+                    // consecutive-failure accumulation on a single stale/broken pool pair.
+                    let sim_pair_key = best.pool_addresses.join("-");
+                    if let Some(&expire_at) = sim_blacklist.get(&sim_pair_key) {
+                        if std::time::Instant::now() < expire_at {
+                            debug!("[SimBlacklist] Skipping blacklisted pair {}", &sim_pair_key);
+                            continue; // skip to next mint
+                        }
+                        sim_blacklist.remove(&sim_pair_key);
+                    }
+
                     let num_hops = best.path.len();
                     let buy_dex = best.path.first().map(|p| p.dex.as_str()).unwrap_or("unknown");
                     let sell_dex = best.path.last().map(|p| p.dex.as_str()).unwrap_or("unknown");
@@ -793,6 +1018,14 @@ async fn main() -> Result<()> {
 
                         info!("Profitable after gas: net={:.6} SOL (gas={:.6} SOL), building TX...", net_profit, est_gas_cost);
 
+                        // For 3-leg paths, ensure all intermediate token ATAs exist on-chain
+                        // before building the main transaction. 2-leg ATAs are handled at startup.
+                        if best.path.len() >= 3 {
+                            if let Err(e) = tx_builder.ensure_intermediate_atas(&best.path) {
+                                warn!("[ATA-Preflight] Failed: {} — continuing anyway", e);
+                            }
+                        }
+
                         // Build swap instructions from opportunity path
                         match tx_builder.build_instructions_from_opportunity(
                             best,
@@ -802,6 +1035,25 @@ async fn main() -> Result<()> {
                         ) {
                             Ok(swap_ixs) => {
                                 info!("Built {} swap instructions", swap_ixs.len());
+
+                                // Log 3-leg atomic cycle details before building the transaction
+                                if best.path.len() == 3 {
+                                    let route = best.path.iter()
+                                        .map(|s| s.dex.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" → ");
+                                    let via = if config.flashloan_enabled
+                                        && !config.flashloan_reserve.is_empty()
+                                    {
+                                        "FlashLoan"
+                                    } else if config.jito_enabled {
+                                        "Jito"
+                                    } else {
+                                        "Standard"
+                                    };
+                                    info!("[3-leg] Atomic cycle: {} | profit={:.4} SOL | via={}",
+                                        route, best.gross_profit_sol, via);
+                                }
 
                                 match tx_builder.get_recent_blockhash() {
                                     Ok(blockhash) => {
@@ -946,8 +1198,14 @@ async fn main() -> Result<()> {
                                                         }
                                                     }
                                                     Ok(false) => {
+                                                        // Blacklist this pair for 5 minutes so repeated
+                                                        // simulation failures don't cascade into circuit breaker.
+                                                        sim_blacklist.insert(
+                                                            sim_pair_key.clone(),
+                                                            std::time::Instant::now() + std::time::Duration::from_secs(300),
+                                                        );
                                                         consecutive_failures += 1;
-                                                        warn!("Simulation failed (consecutive_failures={}), skipping", consecutive_failures);
+                                                        warn!("Simulation failed — pair blacklisted 5min (consecutive_failures={}), skipping", consecutive_failures);
                                                         if consecutive_failures >= 50 {
                                                             error!("Circuit breaker: 50 consecutive failures, shutting down");
                                                             bail!("Circuit breaker triggered: 50 consecutive failures");
@@ -972,7 +1230,20 @@ async fn main() -> Result<()> {
                                                             warn!("Failed to log failed trade: {}", e);
                                                         }
                                                     }
-                                                    Err(e) => warn!("Simulation error: {}", e),
+                                                    Err(e) => {
+                                                        let err_str = e.to_string();
+                                                        if err_str.contains("too large") {
+                                                            // TX structurally too large for this pair (ALT coverage missing).
+                                                            // Blacklist for 5 min — won't shrink on its own.
+                                                            sim_blacklist.insert(
+                                                                sim_pair_key.clone(),
+                                                                std::time::Instant::now() + std::time::Duration::from_secs(300),
+                                                            );
+                                                            warn!("TX too large — pair blacklisted 5min: {}", e);
+                                                        } else {
+                                                            warn!("Simulation error: {}", e);
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Err(e) => warn!("Failed to build tx: {}", e),

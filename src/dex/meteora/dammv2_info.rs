@@ -14,8 +14,8 @@ pub struct MeteoraDAmmV2Info {
     pub b_vault_lp: Pubkey,
     pub a_vault_lp_bump: u8,
     pub enabled: bool,
-    pub protocol_token_a_fee: u64,
-    pub protocol_token_b_fee: u64,
+    pub admin_token_a_fee: Pubkey,
+    pub admin_token_b_fee: Pubkey,
     pub trade_fee_bps: u64,
     pub reserve_a: u64,
     pub reserve_b: u64,
@@ -24,7 +24,7 @@ pub struct MeteoraDAmmV2Info {
 impl MeteoraDAmmV2Info {
     #[allow(unused_assignments)]
     pub fn try_deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < 8 + 32 * 7 + 1 + 1 + 8 * 2 {
+        if data.len() < 8 + 32 * 7 + 1 + 1 + 32 * 2 {
             return Err(anyhow!("Data too short for MeteoraDAmmV2Info: {} bytes", data.len()));
         }
 
@@ -49,8 +49,10 @@ impl MeteoraDAmmV2Info {
         let b_vault_lp = read_pubkey!();
         let a_vault_lp_bump = d[offset]; offset += 1;
         let enabled = d[offset] != 0; offset += 1;
-        let protocol_token_a_fee = u64::from_le_bytes(d[offset..offset+8].try_into().unwrap()); offset += 8;
-        let protocol_token_b_fee = u64::from_le_bytes(d[offset..offset+8].try_into().unwrap()); offset += 8;
+        // admin_token_a_fee and admin_token_b_fee are Pubkeys (32 bytes each),
+        // at raw offsets d[226..258] and d[258..290] (after 8-byte discriminator).
+        let admin_token_a_fee = read_pubkey!();
+        let admin_token_b_fee = read_pubkey!();
 
         Ok(Self {
             pool,
@@ -62,8 +64,8 @@ impl MeteoraDAmmV2Info {
             b_vault_lp,
             a_vault_lp_bump,
             enabled,
-            protocol_token_a_fee,
-            protocol_token_b_fee,
+            admin_token_a_fee,
+            admin_token_b_fee,
             trade_fee_bps: 30, // default 0.3%
             reserve_a: 0, // set from vault balances
             reserve_b: 0,

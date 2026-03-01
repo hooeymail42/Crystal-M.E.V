@@ -11,7 +11,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
-    transaction::VersionedTransaction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
@@ -325,6 +325,11 @@ impl TransactionBuilder {
 
         if let Some(err) = result.value.err {
             warn!("Simulation failed: {:?}", err);
+            if let Some(logs) = &result.value.logs {
+                for log in logs.iter().take(40) {
+                    warn!("  sim_log: {}", log);
+                }
+            }
             Ok(false)
         } else {
             let units_consumed = result.value.units_consumed.unwrap_or(0);
@@ -481,6 +486,87 @@ impl TransactionBuilder {
         Ok(bundle_id)
     }
 
+    /// Ensure ATAs exist on-chain for every intermediate token in a multi-leg path.
+    ///
+    /// For 3-leg paths the intermediate tokens may not be in the configured mint list, so their
+    /// ATAs are never created at startup.  This method does a single `get_multiple_accounts` RPC
+    /// call to batch-check all relevant mints and sends a preflight tx for any missing ones.
+    ///
+    /// Only call this when `path.len() >= 3`; 2-leg ATA creation is handled at startup.
+    pub fn ensure_intermediate_atas(&self, path: &[PathStep]) -> Result<()> {
+        if path.len() < 3 {
+            return Ok(());
+        }
+
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+
+        // Collect unique mints across all steps, skipping WSOL
+        let mut mints: Vec<Pubkey> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for step in path {
+            for addr_str in [&step.token_in, &step.token_out] {
+                if let Ok(pk) = Pubkey::from_str(addr_str) {
+                    if pk != sol_mint && seen.insert(pk) {
+                        mints.push(pk);
+                    }
+                }
+            }
+        }
+
+        if mints.is_empty() {
+            return Ok(());
+        }
+
+        // Derive ATAs for all candidate mints
+        let atas: Vec<Pubkey> = mints
+            .iter()
+            .map(|mint| get_associated_token_address(&self.payer.pubkey(), mint))
+            .collect();
+
+        // Single RPC call to batch-check existence
+        let accounts = self.rpc.get_multiple_accounts(&atas)
+            .map_err(|e| anyhow!("ensure_intermediate_atas: get_multiple_accounts failed: {}", e))?;
+
+        let missing_mints: Vec<Pubkey> = mints
+            .iter()
+            .zip(accounts.iter())
+            .filter_map(|(mint, acct)| if acct.is_none() { Some(*mint) } else { None })
+            .collect();
+
+        if missing_mints.is_empty() {
+            return Ok(());
+        }
+
+        info!("[ATA-Preflight] Creating {} missing intermediate ATAs for 3-leg path",
+            missing_mints.len());
+
+        let blockhash = self.rpc.get_latest_blockhash()
+            .map_err(|e| anyhow!("ensure_intermediate_atas: get_latest_blockhash failed: {}", e))?;
+
+        let ixs: Vec<Instruction> = missing_mints.iter().map(|mint| {
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &self.payer.pubkey(),
+                &self.payer.pubkey(),
+                mint,
+                &spl_token::id(),
+            )
+        }).collect();
+
+        let tx = Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&self.payer.pubkey()),
+            &[self.payer.as_ref()],
+            blockhash,
+        );
+
+        match self.rpc.send_and_confirm_transaction(&tx) {
+            Ok(sig) => info!("[ATA-Preflight] Intermediate ATAs created: {}", sig),
+            Err(e) => warn!("[ATA-Preflight] Intermediate ATA creation failed (may already exist): {}", e),
+        }
+
+        Ok(())
+    }
+
     /// Build swap instructions from an ArbitrageOpportunity path.
     /// Uses the refresh manager's deserialized pool states to get actual vault addresses.
     pub fn build_instructions_from_opportunity(
@@ -491,13 +577,26 @@ impl TransactionBuilder {
         slippage_bps: u64,
     ) -> Result<Vec<Instruction>> {
         let mut instructions = Vec::new();
+        let total_legs = opportunity.path.len();
 
-        for step in &opportunity.path {
+        for (idx, step) in opportunity.path.iter().enumerate() {
             let pool_address = Pubkey::from_str(&step.pool_address)
                 .map_err(|e| anyhow!("Invalid pool address {}: {}", step.pool_address, e))?;
 
             let amount_in = step.amount_in as u64;
-            let min_amount_out = ((step.amount_out as f64) * (10000.0 - slippage_bps as f64) / 10000.0) as u64;
+            let effective_slippage = if step.slippage_bps > 0 {
+                step.slippage_bps as f64
+            } else {
+                slippage_bps as f64
+            };
+            let min_amount_out = ((step.amount_out as f64) * (10000.0 - effective_slippage) / 10000.0) as u64;
+
+            info!("[Leg {}/{}] {} {} → {} | in={:.4} out={:.4} (min={:.4}) slippage={}bps",
+                idx + 1, total_legs,
+                step.dex, step.token_in, step.token_out,
+                step.amount_in / 1e9, step.amount_out / 1e9,
+                min_amount_out as f64 / 1e9,
+                effective_slippage as u64);
 
             let ix = match step.dex.as_str() {
                 "Raydium" => {
@@ -571,7 +670,7 @@ impl TransactionBuilder {
     ) -> Result<Instruction> {
         let program_id = raydium_amm_program_id();
 
-        let (coin_vault, pc_vault, coin_mint, _pc_mint,
+        let (coin_vault, pc_vault, coin_mint, pc_mint,
              amm_open_orders, amm_target_orders,
              serum_market, serum_program_id) = match refresh_manager.get_pool_state(pool_address) {
             Some(DeserializedPoolState::RaydiumAmm {
@@ -588,15 +687,24 @@ impl TransactionBuilder {
             }
         };
 
-        // Derive user ATAs based on swap direction
-        let (user_source, user_dest) = if step.action == "buy" {
-            // buying tokens with SOL: source=WSOL ATA, dest=token ATA
-            let sol_mint = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
-            (self.get_user_ata(&sol_mint), self.get_user_ata(&coin_mint))
+        // Derive user ATAs based on swap direction.
+        // Raydium V4 infers direction from userSourceToken.mint vs coin_vault.mint:
+        //   if source.mint == coin_mint → coin→pc swap
+        //   if source.mint == pc_mint   → pc→coin swap
+        // coin_mint may be SOL or the token depending on pool creation order.
+        let sol_mint = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
+        let coin_is_sol = coin_mint == sol_mint;
+        let wsol_ata = self.get_user_ata(&sol_mint);
+        // token ATA is on whichever side is NOT SOL
+        let token_ata = if coin_is_sol {
+            self.get_user_ata(&pc_mint)
         } else {
-            // selling tokens for SOL
-            let sol_mint = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
-            (self.get_user_ata(&coin_mint), self.get_user_ata(&sol_mint))
+            self.get_user_ata(&coin_mint)
+        };
+        let (user_source, user_dest) = if step.action == "buy" {
+            (wsol_ata, token_ata)
+        } else {
+            (token_ata, wsol_ata)
         };
 
         let amm_authority = Self::raydium_amm_authority();
@@ -685,24 +793,47 @@ impl TransactionBuilder {
     ) -> Result<Instruction> {
         let program_id = meteora_dlmm_program_id();
 
-        let (reserve_x, reserve_y, token_x_mint, token_y_mint) = match refresh_manager.get_pool_state(pool_address) {
+        let (reserve_x, reserve_y, token_x_mint, token_y_mint, active_id) = match refresh_manager.get_pool_state(pool_address) {
             Some(DeserializedPoolState::MeteoraDlmm {
-                reserve_x_vault, reserve_y_vault, token_x_mint, token_y_mint, ..
+                reserve_x_vault, reserve_y_vault, token_x_mint, token_y_mint, active_id, ..
             }) => {
-                (*reserve_x_vault, *reserve_y_vault, *token_x_mint, *token_y_mint)
+                (*reserve_x_vault, *reserve_y_vault, *token_x_mint, *token_y_mint, *active_id)
             }
             _ => {
                 return Err(anyhow!("No deserialized state for DLMM pool {}", pool_address));
             }
         };
 
-        // Derive user ATAs
+        // Derive user ATAs based on swap direction
+        // Determine which token is SOL
+        let sol_mint_pubkey = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+        let x_is_sol = token_x_mint == sol_mint_pubkey;
+
         let (user_token_in, user_token_out) = if step.action == "buy" {
-            // Buying token_x with token_y (SOL)
-            (self.get_user_ata(&token_y_mint), self.get_user_ata(&token_x_mint))
+            // Buying: spend one token, receive the other
+            if x_is_sol {
+                // X=SOL, Y=token: buying Y with SOL → spend X (SOL), receive Y (token)
+                (self.get_user_ata(&token_x_mint), self.get_user_ata(&token_y_mint))
+            } else {
+                // Y=SOL, X=token: buying X with SOL → spend Y (SOL), receive X (token)
+                (self.get_user_ata(&token_y_mint), self.get_user_ata(&token_x_mint))
+            }
         } else {
-            (self.get_user_ata(&token_x_mint), self.get_user_ata(&token_y_mint))
+            // Selling: spend token, receive SOL
+            if x_is_sol {
+                // X=SOL, Y=token: selling token for SOL → spend Y (token), receive X (SOL)
+                (self.get_user_ata(&token_y_mint), self.get_user_ata(&token_x_mint))
+            } else {
+                // Y=SOL, X=token: selling token for SOL → spend X (token), receive Y (SOL)
+                (self.get_user_ata(&token_x_mint), self.get_user_ata(&token_y_mint))
+            }
         };
+
+        // Derive oracle PDA: seeds = [b"oracle", pool_address]
+        let (oracle, _) = Pubkey::find_program_address(
+            &[b"oracle", pool_address.as_ref()],
+            &program_id,
+        );
 
         // Derive event authority PDA
         let (event_authority, _) = Pubkey::find_program_address(
@@ -710,11 +841,33 @@ impl TransactionBuilder {
             &program_id,
         );
 
-        // Derive bin array bitmap extension PDA
-        let (bin_array_bitmap_extension, _) = Pubkey::find_program_address(
-            &[b"bitmap", pool_address.as_ref()],
-            &program_id,
-        );
+        // binArrayBitmapExtension: Meteora SDK passes the DLMM program ID as the "None"
+        // sentinel when the pool does not have a bitmap extension account (most pools).
+        // If the pool state records a bitmap_extension, use it; otherwise use program_id.
+        let bin_array_bitmap_extension = match refresh_manager.get_pool_state(pool_address) {
+            Some(DeserializedPoolState::MeteoraDlmm { bitmap_extension, .. }) => {
+                bitmap_extension.unwrap_or(program_id)
+            }
+            _ => program_id,
+        };
+
+        // Calculate bin array indices around the active bin.
+        // Use div_euclid (floor division) to handle negative active_ids correctly.
+        // Rust's `/` truncates toward zero: -2506/70 = -35, but floor is -36.
+        let active_bin_idx = active_id.div_euclid(70);
+
+        // Derive bin array PDAs for indices: active-1, active, active+1
+        // This ensures we have enough bins to cover price movement
+        let mut bin_arrays = Vec::new();
+        for offset in [-1i64, 0i64, 1i64] {
+            let bin_idx = (active_bin_idx as i64 + offset) as i64;
+            let bin_idx_bytes = bin_idx.to_le_bytes();
+            let (bin_array_pda, _) = Pubkey::find_program_address(
+                &[b"bin_array", pool_address.as_ref(), &bin_idx_bytes],
+                &program_id,
+            );
+            bin_arrays.push(AccountMeta::new(bin_array_pda, false));
+        }
 
         let mut data = Vec::new();
         // DLMM swap discriminator (anchor: hash of "global:swap")
@@ -722,20 +875,45 @@ impl TransactionBuilder {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
+        let mut accounts = vec![
+            // 0: lbPair (writable)
+            AccountMeta::new(*pool_address, false),
+            // 1: binArrayBitmapExtension (optional, can be program_id placeholder if not needed)
+            AccountMeta::new_readonly(bin_array_bitmap_extension, false),
+            // 2: reserveX (writable)
+            AccountMeta::new(reserve_x, false),
+            // 3: reserveY (writable)
+            AccountMeta::new(reserve_y, false),
+            // 4: userTokenIn (writable)
+            AccountMeta::new(user_token_in, false),
+            // 5: userTokenOut (writable)
+            AccountMeta::new(user_token_out, false),
+            // 6: tokenXMint (readonly)
+            AccountMeta::new_readonly(token_x_mint, false),
+            // 7: tokenYMint (readonly)
+            AccountMeta::new_readonly(token_y_mint, false),
+            // 8: oracle (writable PDA)
+            AccountMeta::new(oracle, false),
+            // 9: hostFeeIn (must be a valid SPL token account; use user_token_in as no-fee placeholder)
+            AccountMeta::new(user_token_in, false),
+            // 10: user (signer)
+            AccountMeta::new_readonly(self.payer.pubkey(), true),
+            // 11: tokenXProgram (readonly, spl_token)
+            AccountMeta::new_readonly(spl_token::id(), false),
+            // 12: tokenYProgram (readonly, spl_token)
+            AccountMeta::new_readonly(spl_token::id(), false),
+            // 13: eventAuthority (readonly PDA)
+            AccountMeta::new_readonly(event_authority, false),
+            // 14: program (readonly, self-referential)
+            AccountMeta::new_readonly(program_id, false),
+        ];
+
+        // Add remaining accounts: bin_array_0, bin_array_1, bin_array_2 (writable PDAs)
+        accounts.extend(bin_arrays);
+
         Ok(Instruction {
             program_id,
-            accounts: vec![
-                AccountMeta::new(*pool_address, false),
-                AccountMeta::new_readonly(bin_array_bitmap_extension, false),
-                AccountMeta::new(reserve_x, false),
-                AccountMeta::new(reserve_y, false),
-                AccountMeta::new(user_token_in, false),
-                AccountMeta::new(user_token_out, false),
-                AccountMeta::new_readonly(spl_token::id(), false),
-                AccountMeta::new_readonly(event_authority, false),
-                AccountMeta::new_readonly(program_id, false),
-                AccountMeta::new_readonly(self.payer.pubkey(), true),
-            ],
+            accounts,
             data,
         })
     }
@@ -749,40 +927,76 @@ impl TransactionBuilder {
         step: &PathStep,
     ) -> Result<Instruction> {
         let program_id = meteora_damm_v2_program_id();
+        let vault_program = Pubkey::from_str("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi")
+            .expect("static vault program address");
 
-        let (a_vault, b_vault, token_a_mint, token_b_mint) = match refresh_manager.get_pool_state(pool_address) {
-            Some(DeserializedPoolState::MeteoraDAmmV2 {
-                a_vault, b_vault, token_a_mint, token_b_mint, ..
-            }) => {
-                (*a_vault, *b_vault, *token_a_mint, *token_b_mint)
-            }
-            _ => {
-                return Err(anyhow!("No deserialized state for DAMM V2 pool {}", pool_address));
-            }
-        };
+        let (a_vault, b_vault, token_a_mint, token_b_mint, a_vault_lp, b_vault_lp,
+             admin_token_a_fee, admin_token_b_fee) =
+            match refresh_manager.get_pool_state(pool_address) {
+                Some(DeserializedPoolState::MeteoraDAmmV2 {
+                    a_vault, b_vault, token_a_mint, token_b_mint,
+                    a_vault_lp, b_vault_lp,
+                    admin_token_a_fee, admin_token_b_fee, ..
+                }) => (
+                    *a_vault, *b_vault, *token_a_mint, *token_b_mint,
+                    *a_vault_lp, *b_vault_lp,
+                    *admin_token_a_fee, *admin_token_b_fee,
+                ),
+                _ => return Err(anyhow!("No deserialized state for DAMM V2 pool {}", pool_address)),
+            };
 
-        // Derive user ATAs
-        let (user_source_token, user_destination_token) = if step.action == "buy" {
-            (self.get_user_ata(&token_b_mint), self.get_user_ata(&token_a_mint))
-        } else {
-            (self.get_user_ata(&token_a_mint), self.get_user_ata(&token_b_mint))
-        };
+        let swap_accts = refresh_manager.get_damm_v2_swap_accounts(pool_address)
+            .ok_or_else(|| anyhow!("No vault-internal accounts cached for DAMM V2 pool {}. Wait for first refresh cycle.", pool_address))?;
+
+        let a_token_vault  = swap_accts.a_token_vault;
+        let b_token_vault  = swap_accts.b_token_vault;
+        let a_vault_lp_mint = swap_accts.a_vault_lp_mint;
+        let b_vault_lp_mint = swap_accts.b_vault_lp_mint;
+
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .expect("static SOL mint address");
+        let a_is_sol = token_a_mint == sol_mint;
+
+        // User ATAs for both sides
+        let user_a = self.get_user_ata(&token_a_mint);
+        let user_b = self.get_user_ata(&token_b_mint);
+
+        // Meteora DAMM direction: swapForY = A→B
+        //   Buy  (SOL→token) + a_is_sol=true:  source=user_a(WSOL), dest=user_b(token), fee=adminTokenBFee
+        //   Buy  (SOL→token) + a_is_sol=false: source=user_b(WSOL), dest=user_a(token), fee=adminTokenAFee
+        //   Sell (token→SOL) + a_is_sol=true:  source=user_b(token), dest=user_a(WSOL), fee=adminTokenAFee
+        //   Sell (token→SOL) + a_is_sol=false: source=user_a(token), dest=user_b(WSOL), fee=adminTokenBFee
+        let (user_source_token, user_destination_token, admin_token_fee) =
+            match (step.action.as_str(), a_is_sol) {
+                ("buy", true)  => (user_a, user_b, admin_token_b_fee),
+                ("buy", false) => (user_b, user_a, admin_token_a_fee),
+                ("sell", true) => (user_b, user_a, admin_token_a_fee),
+                _              => (user_a, user_b, admin_token_b_fee), // sell + a_is_sol=false
+            };
 
         let mut data = Vec::new();
-        data.extend_from_slice(&[248, 198, 158, 145, 225, 117, 135, 200]); // swap discriminator
+        data.extend_from_slice(&[248, 198, 158, 145, 225, 117, 135, 200]); // global:swap discriminator
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
         Ok(Instruction {
             program_id,
             accounts: vec![
-                AccountMeta::new(*pool_address, false),
-                AccountMeta::new(a_vault, false),
-                AccountMeta::new(b_vault, false),
-                AccountMeta::new(user_source_token, false),
-                AccountMeta::new(user_destination_token, false),
-                AccountMeta::new_readonly(spl_token::id(), false),
-                AccountMeta::new_readonly(self.payer.pubkey(), true),
+                AccountMeta::new(*pool_address, false),       // 0: pool
+                AccountMeta::new(user_source_token, false),   // 1: userSourceToken
+                AccountMeta::new(user_destination_token, false), // 2: userDestinationToken
+                AccountMeta::new(a_vault, false),             // 3: aVault
+                AccountMeta::new(b_vault, false),             // 4: bVault
+                AccountMeta::new(a_token_vault, false),       // 5: aTokenVault (SPL acct inside a_vault)
+                AccountMeta::new(b_token_vault, false),       // 6: bTokenVault (SPL acct inside b_vault)
+                AccountMeta::new(a_vault_lp_mint, false),     // 7: aVaultLpMint
+                AccountMeta::new(b_vault_lp_mint, false),     // 8: bVaultLpMint
+                AccountMeta::new(a_vault_lp, false),          // 9: aVaultLp (pool's LP SPL acct in a_vault)
+                AccountMeta::new(b_vault_lp, false),          // 10: bVaultLp (pool's LP SPL acct in b_vault)
+                AccountMeta::new(admin_token_fee, false),     // 11: adminTokenFee (direction-dependent)
+                AccountMeta::new_readonly(self.payer.pubkey(), true), // 12: user (signer)
+                AccountMeta::new_readonly(vault_program, false),      // 13: vaultProgram
+                AccountMeta::new_readonly(spl_token::id(), false),    // 14: tokenProgram
             ],
             data,
         })
@@ -1350,17 +1564,18 @@ impl TransactionBuilder {
         Instruction {
             program_id: klend,
             accounts: vec![
-                AccountMeta::new_readonly(self.payer.pubkey(), true),  // user_transfer_authority
-                AccountMeta::new_readonly(market_authority, false),     // lending_market_authority
-                AccountMeta::new_readonly(market, false),              // lending_market
-                AccountMeta::new(*reserve, false),                     // reserve
-                AccountMeta::new(*reserve_liquidity_vault, false),     // reserve_source_liquidity
-                AccountMeta::new(user_wsol_ata, false),                // user_destination_liquidity
-                AccountMeta::new(*fee_receiver, false),                // reserve_liquidity_fee_receiver
-                AccountMeta::new_readonly(klend, false),               // referrer_token_state (placeholder)
-                AccountMeta::new_readonly(klend, false),               // referrer_account (placeholder)
-                AccountMeta::new_readonly(sysvar, false),              // sysvar_info
-                AccountMeta::new_readonly(spl_token::id(), false),     // token_program
+                AccountMeta::new_readonly(self.payer.pubkey(), true),          //  0: user_transfer_authority (readonly signer)
+                AccountMeta::new_readonly(market_authority, false),             //  1: lending_market_authority (readonly PDA)
+                AccountMeta::new_readonly(market, false),                       //  2: lending_market (readonly)
+                AccountMeta::new(*reserve, false),                             //  3: reserve (writable)
+                AccountMeta::new_readonly(spl_token::native_mint::id(), false), //  4: reserve_liquidity_mint (readonly: native SOL mint)
+                AccountMeta::new(*reserve_liquidity_vault, false),             //  5: reserve_source_liquidity (writable: vault)
+                AccountMeta::new(user_wsol_ata, false),                        //  6: user_destination_liquidity (writable: receives borrowed SOL)
+                AccountMeta::new(*fee_receiver, false),                        //  7: reserve_liquidity_fee_receiver (writable)
+                AccountMeta::new_readonly(klend, false),                       //  8: referrer_token_state (None → program_id placeholder)
+                AccountMeta::new_readonly(klend, false),                       //  9: referrer_account (None → program_id placeholder)
+                AccountMeta::new_readonly(sysvar, false),                      // 10: sysvar_instructions (readonly)
+                AccountMeta::new_readonly(spl_token::id(), false),             // 11: token_program (readonly)
             ],
             data,
         }
@@ -1389,17 +1604,18 @@ impl TransactionBuilder {
         Instruction {
             program_id: klend,
             accounts: vec![
-                AccountMeta::new_readonly(self.payer.pubkey(), true),  // user_transfer_authority
-                AccountMeta::new_readonly(market_authority, false),     // lending_market_authority
-                AccountMeta::new_readonly(market, false),              // lending_market
-                AccountMeta::new(*reserve, false),                     // reserve
-                AccountMeta::new(*reserve_liquidity_vault, false),     // reserve_destination_liquidity
-                AccountMeta::new(user_wsol_ata, false),                // user_source_liquidity
-                AccountMeta::new(*fee_receiver, false),                // reserve_liquidity_fee_receiver
-                AccountMeta::new_readonly(klend, false),               // referrer_token_state
-                AccountMeta::new_readonly(klend, false),               // referrer_account
-                AccountMeta::new_readonly(sysvar, false),              // sysvar_info
-                AccountMeta::new_readonly(spl_token::id(), false),     // token_program
+                AccountMeta::new_readonly(self.payer.pubkey(), true),          //  0: user_transfer_authority (readonly signer)
+                AccountMeta::new_readonly(market_authority, false),             //  1: lending_market_authority (readonly PDA)
+                AccountMeta::new_readonly(market, false),                       //  2: lending_market (readonly)
+                AccountMeta::new(*reserve, false),                             //  3: reserve (writable)
+                AccountMeta::new_readonly(spl_token::native_mint::id(), false), //  4: reserve_liquidity_mint (readonly: native SOL mint)
+                AccountMeta::new(*reserve_liquidity_vault, false),             //  5: reserve_destination_liquidity (writable: receives repay)
+                AccountMeta::new(user_wsol_ata, false),                        //  6: user_source_liquidity (writable: source of repayment)
+                AccountMeta::new(*fee_receiver, false),                        //  7: reserve_liquidity_fee_receiver (writable)
+                AccountMeta::new_readonly(klend, false),                       //  8: referrer_token_state (None → program_id placeholder)
+                AccountMeta::new_readonly(klend, false),                       //  9: referrer_account (None → program_id placeholder)
+                AccountMeta::new_readonly(sysvar, false),                      // 10: sysvar_instructions (readonly)
+                AccountMeta::new_readonly(spl_token::id(), false),             // 11: token_program (readonly)
             ],
             data,
         }
@@ -1407,6 +1623,7 @@ impl TransactionBuilder {
 
     /// Build a flash loan arbitrage transaction:
     /// [compute_limit, compute_price, flash_borrow, swap_ix..., flash_repay]
+    /// Note: WSOL ATA is created once at startup in main.rs, not in each transaction.
     pub fn build_flashloan_transaction(
         &self,
         swap_instructions: Vec<Instruction>,
@@ -1431,11 +1648,11 @@ impl TransactionBuilder {
         // idx 3..N: swap instructions
         instructions.extend(swap_instructions);
 
-        // idx N+1: flash repay (include ~0.09% Kamino flash loan fee)
-        let flash_loan_fee = borrow_amount / 1111 + 1; // ~0.09% rounded up
-        let repay_amount = borrow_amount + flash_loan_fee;
+        // idx N+1: flash repay
+        // liquidityAmount in repay data must equal the borrow amount (NOT borrow+fee).
+        // Kamino calculates and charges the flash loan fee (~0.09%) internally.
         instructions.push(self.build_flash_repay_ix(
-            repay_amount, borrow_ix_index, reserve, reserve_vault, fee_receiver,
+            borrow_amount, borrow_ix_index, reserve, reserve_vault, fee_receiver,
         ));
 
         self.build_versioned_tx(&instructions, recent_blockhash)

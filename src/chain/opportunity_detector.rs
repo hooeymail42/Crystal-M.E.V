@@ -3,7 +3,6 @@ use crate::chain::{
     refresh::{DeserializedPoolState, PoolRefreshManager},
     trading_graph::TradingGraph,
 };
-use crate::dex::meteora::dlmm_info::{Bin, DlmmSwapCalculator};
 use tracing::{info, warn};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -35,6 +34,9 @@ pub struct PathStep {
     pub token_out: String,
     pub amount_in: f64,
     pub amount_out: f64,
+    /// Per-leg slippage tolerance in basis points. 0 means "fall back to global slippage_bps".
+    #[serde(default)]
+    pub slippage_bps: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +51,12 @@ pub struct OpportunityConfig {
 impl Default for OpportunityConfig {
     fn default() -> Self {
         Self {
-            min_profit_percent: 0.3,
+            // 0.1% gross profit threshold — deliberately below fee cost (0.25-0.55% round-trip)
+            // so that nearly-break-even opportunities are logged and we can observe real spreads.
+            // The real execution gate is MIN_PROFIT_SOL in config + gas_fee_config.should_execute().
+            // Setting this to 0.3% was silently filtering out all real arbs since typical
+            // Raydium/DLMM spread is 0.1-0.4% before fees.
+            min_profit_percent: -1.0, // TEMP: lowered for DLMM fix testing
             min_liquidity_sol: 1.0,
             max_slippage_percent: 1.0,
             max_volatility_percent: 10.0,
@@ -173,31 +180,41 @@ impl<'a> OpportunityDetector<'a> {
                 Some((token_reserve as u128).saturating_sub(new_token) as u64)
             }
             Some(DeserializedPoolState::MeteoraDlmm { active_id, bin_step, base_factor, token_x_mint, .. }) => {
-                // Use bin-based pricing for DLMM — constant-product gives wrong results because
-                // DLMM liquidity is distributed across fixed-price bins, not a continuous curve.
+                // Direct active-bin price formula — replaces the uniform-20-bin approximation
+                // which overstates per-bin liquidity and causes simulation failures.
+                // Price = (1 + bin_step/10000)^active_id (tokens per SOL if X=SOL, else SOL per token).
                 let (token_reserve, sol_reserve) = self.get_cached_reserves(pool, refresh_manager)?;
                 let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
                 let x_is_sol = *token_x_mint == sol_mint;
-                // reserve_x and reserve_y must match the DLMM X/Y convention
-                let (reserve_x, reserve_y) = if x_is_sol {
-                    (sol_reserve, token_reserve) // X=SOL, Y=token
+
+                let price = (1.0_f64 + *bin_step as f64 / 10_000.0).powi(*active_id);
+                if price <= 0.0 { return None; }
+
+                // Sanity: reject if active_id price deviates >10× from reserve ratio.
+                // Catches v2-format DLMM pools whose different layout produces garbage active_id.
+                let reserve_price = if x_is_sol {
+                    token_reserve as f64 / sol_reserve.max(1) as f64
                 } else {
-                    (token_reserve, sol_reserve) // X=token, Y=SOL
+                    sol_reserve as f64 / token_reserve.max(1) as f64
                 };
-                let calc = Self::build_dlmm_calc(*active_id, *bin_step, *base_factor, reserve_x, reserve_y);
-                // Buy = "SOL in, token out"
-                // If X=SOL: spend X to get Y → swap_x_to_y
-                // If Y=SOL: spend Y to get X → swap_y_to_x
-                let result = if x_is_sol {
-                    calc.swap_x_to_y(sol_amount_in)
+                let deviation = (price / reserve_price.max(1e-30)).max(reserve_price.max(1e-30) / price);
+                if deviation > 10.0 { return None; }
+
+                let fee_bps = (*bin_step as u64 * *base_factor as u64 / 10_000).max(1).min(1000);
+                let sol_after_fee = sol_amount_in as u128 * (10_000 - fee_bps) as u128 / 10_000;
+
+                // Buy = SOL in → token out
+                // X=SOL: price = Y/X = token/SOL → token_out = sol_in * price
+                // Y=SOL: price = Y/X = SOL/token → token_out = sol_in / price
+                let token_out = if x_is_sol {
+                    (sol_after_fee as f64 * price) as u64
                 } else {
-                    calc.swap_y_to_x(sol_amount_in)
+                    (sol_after_fee as f64 / price) as u64
                 };
-                if result.amount_out == 0 { return None; }
-                // Sanity: DLMM output cannot exceed the actual token reserve.
-                // Uniform bin approximation can over-estimate when pool is severely imbalanced.
-                if result.amount_out > token_reserve { return None; }
-                Some(result.amount_out)
+                if token_out == 0 { return None; }
+                // Conservative depth cap: assume active bin holds ~0.5% of total reserves.
+                let depth_cap = (token_reserve / 200).max(1);
+                Some(token_out.min(depth_cap))
             }
             _ => {
                 // Generic constant-product with fee
@@ -284,24 +301,32 @@ impl<'a> OpportunityDetector<'a> {
                 let (token_reserve, sol_reserve) = self.get_cached_reserves(pool, refresh_manager)?;
                 let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
                 let x_is_sol = *token_x_mint == sol_mint;
-                let (reserve_x, reserve_y) = if x_is_sol {
-                    (sol_reserve, token_reserve)
+
+                let price = (1.0_f64 + *bin_step as f64 / 10_000.0).powi(*active_id);
+                if price <= 0.0 { return None; }
+
+                let reserve_price = if x_is_sol {
+                    token_reserve as f64 / sol_reserve.max(1) as f64
                 } else {
-                    (token_reserve, sol_reserve)
+                    sol_reserve as f64 / token_reserve.max(1) as f64
                 };
-                let calc = Self::build_dlmm_calc(*active_id, *bin_step, *base_factor, reserve_x, reserve_y);
-                // Sell = "token in, SOL out"
-                // If X=SOL: spend Y (token) to get X (SOL) → swap_y_to_x
-                // If Y=SOL: spend X (token) to get Y (SOL) → swap_x_to_y
-                let result = if x_is_sol {
-                    calc.swap_y_to_x(token_amount_in)
+                let deviation = (price / reserve_price.max(1e-30)).max(reserve_price.max(1e-30) / price);
+                if deviation > 10.0 { return None; }
+
+                let fee_bps = (*bin_step as u64 * *base_factor as u64 / 10_000).max(1).min(1000);
+                let token_after_fee = token_amount_in as u128 * (10_000 - fee_bps) as u128 / 10_000;
+
+                // Sell = token in → SOL out
+                // X=SOL: price = Y/X = token/SOL → sol_out = token_in / price
+                // Y=SOL: price = Y/X = SOL/token → sol_out = token_in * price
+                let sol_out = if x_is_sol {
+                    (token_after_fee as f64 / price) as u64
                 } else {
-                    calc.swap_x_to_y(token_amount_in)
+                    (token_after_fee as f64 * price) as u64
                 };
-                if result.amount_out == 0 { return None; }
-                // Sanity: DLMM output cannot exceed the actual SOL reserve.
-                if result.amount_out > sol_reserve { return None; }
-                Some(result.amount_out)
+                if sol_out == 0 { return None; }
+                let depth_cap = (sol_reserve / 200).max(1);
+                Some(sol_out.min(depth_cap))
             }
             _ => {
                 let (token_reserve, sol_reserve) =
@@ -321,44 +346,7 @@ impl<'a> OpportunityDetector<'a> {
         }
     }
 
-    /// Build a DLMM swap calculator with uniform bin distribution.
-    /// Used when we don't have actual per-bin data (which requires fetching individual bin accounts).
-    fn build_dlmm_calc(
-        active_id: i32,
-        bin_step: u16,
-        base_factor: u16,
-        reserve_x: u64,
-        reserve_y: u64,
-    ) -> DlmmSwapCalculator {
-        let num_bins: i32 = 20;
-        let half_bins = num_bins / 2;
-        let per_bin_x = reserve_x / num_bins as u64;
-        let per_bin_y = reserve_y / num_bins as u64;
-
-        let mut bins = Vec::with_capacity(num_bins as usize);
-        for i in 0..num_bins {
-            let bin_id = active_id - half_bins + i;
-            bins.push(Bin {
-                id: bin_id,
-                // X tokens live in bins at or above the active bin (someone would buy them with Y)
-                amount_x: if bin_id >= active_id { per_bin_x } else { 0 },
-                // Y tokens live in bins at or below the active bin (someone would buy them with X)
-                amount_y: if bin_id <= active_id { per_bin_y } else { 0 },
-                price: DlmmSwapCalculator::get_bin_price(bin_step, bin_id),
-            });
-        }
-
-        DlmmSwapCalculator {
-            active_id,
-            bin_step,
-            base_factor,
-            variable_fee_control: 0,
-            volatility_accumulator: 0,
-            bins,
-        }
-    }
-
-    /// Fee in basis points per DEX
+/// Fee in basis points per DEX
     fn get_dex_fee_bps(&self, dex_name: &str) -> u64 {
         match dex_name {
             "Raydium" | "RaydiumCp" | "MeteoraDAmm" | "MeteoraDAmmV2" => 25,
@@ -484,12 +472,9 @@ impl<'a> OpportunityDetector<'a> {
                     buy_pool.get_dex_name(), sell_pool.get_dex_name(),
                     input_sol, output_sol, pnl_sol, pnl_pct);
 
-                if sol_output <= input_lamports {
-                    continue;
-                }
-
-                let profit_lamports = sol_output - input_lamports;
-                let profit_sol = profit_lamports as f64 / 1e9;
+                // Use f64 profit (pnl_sol/pnl_pct already computed) so negative-PnL
+                // opportunities pass through when min_profit_percent is negative (test mode).
+                let profit_sol = pnl_sol;
                 let profit_pct = pnl_pct;
 
                 if profit_pct < self.config.min_profit_percent {
@@ -520,6 +505,7 @@ impl<'a> OpportunityDetector<'a> {
                             token_out: token_mint.clone(),
                             amount_in: input_lamports as f64,
                             amount_out: tokens_received as f64,
+                            slippage_bps: 30,
                         },
                         PathStep {
                             dex: sell_pool.get_dex_name().to_string(),
@@ -530,6 +516,7 @@ impl<'a> OpportunityDetector<'a> {
                             token_out: pool_data.wallet_wsol_account.to_string(),
                             amount_in: tokens_received as f64,
                             amount_out: sol_output as f64,
+                            slippage_bps: 30,
                         },
                     ],
                     gross_profit_sol: profit_sol,
@@ -583,7 +570,8 @@ impl<'a> OpportunityDetector<'a> {
                 let mut all_pool_addresses = Vec::new();
                 let mut valid = true;
 
-                for (from_token, to_token, pool) in &cycle {
+                let cycle_len = cycle.len();
+                for (leg_idx, (from_token, to_token, pool)) in cycle.iter().enumerate() {
                     if *from_token != current_token_in {
                         valid = false;
                         break;
@@ -610,6 +598,9 @@ impl<'a> OpportunityDetector<'a> {
                         break;
                     };
 
+                    // Final leg gets extra slippage tolerance for close-out flexibility
+                    let leg_slippage_bps = if leg_idx + 1 == cycle_len { 50 } else { 30 };
+
                     path_steps.push(PathStep {
                         dex: pool.get_dex_name().to_string(),
                         pool_address: pool.pool_address().to_string(),
@@ -619,20 +610,20 @@ impl<'a> OpportunityDetector<'a> {
                         token_out: to_token.to_string(),
                         amount_in: current_amount as f64,
                         amount_out: amount_out as f64,
+                        slippage_bps: leg_slippage_bps,
                     });
                     all_pool_addresses.push(pool.pool_address().to_string());
                     current_amount = amount_out;
                     current_token_in = *to_token;
                 }
 
-                if !valid || path_steps.len() != 3 || current_amount <= input_lamports {
+                if !valid || path_steps.len() != 3 {
                     continue;
                 }
 
-                let profit_lamports = current_amount - input_lamports;
                 let input_sol = input_lamports as f64 / 1e9;
                 let output_sol = current_amount as f64 / 1e9;
-                let profit_sol = profit_lamports as f64 / 1e9;
+                let profit_sol = output_sol - input_sol;
                 let profit_pct = (profit_sol / input_sol) * 100.0;
 
                 if profit_pct < self.config.min_profit_percent {

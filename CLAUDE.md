@@ -98,12 +98,20 @@ Pool account data uses **Borsh** deserialization. Struct field order must match 
 
 ## Known Gotchas & Bug History
 
-### MeteoraDAmmV2 Vault Accounts (CRITICAL)
-`a_vault` / `b_vault` in `MeteoraDAmmV2Info` are **Meteora Vault Program** accounts, not SPL
-token accounts. Reading them as SPL token accounts (offset 64) produces garbage reserve values
-and phantom arb opportunities (e.g., 2418% profit). Current workaround in `refresh.rs`:
-`refresh_vault_balances()` skips MeteoraDAmmV2 entirely — reserves stay 0 and opportunity
-detector ignores them. Proper fix requires implementing Meteora Vault account deserialization.
+### MeteoraDAmmV2 Vault Accounts (FIXED 2026-03-01)
+`a_vault`/`b_vault` are Meteora Vault Program (`24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi`)
+accounts shared across multiple DAMM pools. Pool reserves are computed via LP-token ratio:
+  `pool_reserve = vault_totalAmount * pool_lp_balance / lp_mint_supply`
+Implemented in `refresh.rs` `refresh_vault_balances` MeteoraDAmmV2 block (3-step RPC fetch):
+  1. Vault accounts → `totalAmount` at [11..19] + `tokenVault` at [19..51] + `lpMint` at [115..147]
+  2. LP mint accounts → `supply` at [36..44] (SPL Mint layout)
+  3. `a_vault_lp`/`b_vault_lp` SPL accounts → pool LP balance at [64..72]
+`DeserializedPoolState::MeteoraDAmmV2` carries `a_vault_lp`, `b_vault_lp`, `admin_token_a_fee`, `admin_token_b_fee`.
+`PoolRefreshManager.damm_v2_swap_accounts` caches `DammV2SwapAccounts` per pool (token vaults + LP mints).
+Swap instruction (`transaction.rs:build_damm_v2_swap_from_step`) has correct 15-account list.
+Pool layout: d[234..266]=admin_token_a_fee (Pubkey), d[266..298]=admin_token_b_fee (Pubkey).
+Admin fee direction: swapForY(A→B) → adminTokenBFee; swapForY=false(B→A) → adminTokenAFee.
+8 DAMM V2 pools active: USDC, USDT, JUP, BONK, WIF, POPCAT, MEW, GRASS (RAY removed — $3.5k TVL).
 
 ### Kamino Flash Loan `Custom(3007)` = BorrowingDisabled
 Wrong reserve address causes this. Current SOL reserve: `d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q`.
@@ -115,25 +123,41 @@ CLMM pools (RaydiumClmm, Whirlpool) produce absurd `in=879 SOL` input amounts. T
 input binary search does not account for concentrated liquidity tick range boundaries. These
 pools are scanned but their opportunities should be treated with extra skepticism until fixed.
 
-### Raydium AMM V4 Coin/PC Vault Ordering
+### Raydium AMM V4 Coin/PC Vault Ordering + User ATA Direction (FIXED 2026-03-01)
 `pool_coin_token_account` is NOT always the token vault — the coin can be SOL or the token
 depending on pool creation order. Must check `coin_mint_address` from deserialized pool state:
 if `coin_mint == SOL_MINT`, then `(token_vault=pc_vault, sol_vault=coin_vault)`, otherwise
 `(token_vault=coin_vault, sol_vault=pc_vault)`. Fixed in `refresh.rs`
 `DeserializedPoolState::RaydiumAmm` match arm.
 
-### DLMM Reserve Cap Sanity Check
-`build_dlmm_calc` in `opportunity_detector.rs` distributes reserves uniformly across 20 bins.
-When a DLMM pool is severely imbalanced (e.g., 500 SOL but only 1032 USDT at market rate of
-82 USDT/SOL), the active_id price may be stale/wrong, producing phantom arb opportunities.
-Defense in depth: buy quote output is capped at `token_reserve`, sell quote output capped at
-`sol_reserve`. Any DLMM pool showing >30% profit should be treated with skepticism.
+User ATA direction (`build_raydium_swap_from_step`): Raydium V4 infers swap direction from
+`userSourceToken.mint` vs `coin_vault.mint`. Old code used `get_user_ata(&coin_mint)` for
+buy destination — wrong if `coin_mint == SOL_MINT` (destination = WSOL = same as source).
+Fix: `token_ata = if coin_is_sol { get_user_ata(&pc_mint) } else { get_user_ata(&coin_mint) }`.
+
+### Raydium V4 Size Guard (FIXED 2026-03-01)
+Raydium V4 AMM accounts are **exactly 1664 bytes**. The old minimum was 752 (wrong). Pools
+from other programs (e.g. `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`) can be 752 bytes,
+pass the old check, and get deserialized as garbage RaydiumAmm state — producing phantom arbs
+and `InvalidSplTokenProgram` (Custom(38)) during simulation. Fix: raise minimum to 1664 in
+`dex/raydium/amm_info.rs:try_deserialize`. Also remove any .env pool addresses not owned by
+the real Raydium V4 program (`675kPX9MHTjS2zt1qfr1NYHuzeLXFQM5p84CmjZrtsm`).
+
+### DLMM Quote Model (FIXED 2026-02-28)
+`opportunity_detector.rs` `calculate_buy_quote`/`calculate_sell_quote` for `MeteoraDlmm` now
+use the **direct active-bin price formula**: `price = (1 + bin_step/10000)^active_id`.
+Guards: (1) reserve-ratio sanity check — reject if price deviates >10× from `token_reserve/sol_reserve`
+ratio (catches v2-format pools with garbage `active_id` reads); (2) depth cap —
+`output.min(reserve / 200)` prevents over-claiming active bin liquidity.
+The old `build_dlmm_calc` / uniform-20-bin model (caused simulation failures due to overstated
+per-bin liquidity) and `Bin`/`DlmmSwapCalculator` imports have been removed.
 
 ### DLMM Program Versions
 Standard DLMM: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` — mints at d[80]/d[112],
 vaults at d[144]/d[176] after 8-byte discriminator. v2 program:
 `Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB` — different layout. Only standard program
-pools work with current deserialization.
+pools work with current deserialization. v2-pool phantom arbs are caught by the >10× deviation
+check (their garbage active_id produces price incompatible with vault balances).
 
 ### Address Lookup Table (ALT)
 The active ALT is `3Xj2vwD535dWUFUQCzWup3SuNhCyCYsbSiXhmpLUbSGw` (44 addresses, created

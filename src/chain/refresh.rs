@@ -4,7 +4,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::chain::pools::{MintPoolData, PoolData};
 use crate::dex::raydium::amm_info::RaydiumAmmInfo;
@@ -141,12 +141,20 @@ pub enum DeserializedPoolState {
         active_id: i32,
         bin_step: u16,
         base_factor: u16,
+        /// Bitmap extension account key if the pool has one; None → pass program_id as placeholder.
+        bitmap_extension: Option<Pubkey>,
     },
     MeteoraDAmmV2 {
         a_vault: Pubkey,
         b_vault: Pubkey,
+        /// Pool's LP-token accounts inside each vault (SPL token accounts, balance at offset 64)
+        a_vault_lp: Pubkey,
+        b_vault_lp: Pubkey,
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
+        /// Admin fee SPL token accounts (direction-dependent in swap instruction)
+        admin_token_a_fee: Pubkey,
+        admin_token_b_fee: Pubkey,
         enabled: bool,
     },
     WhirlpoolState {
@@ -187,13 +195,31 @@ pub enum DeserializedPoolState {
     Unknown,
 }
 
+/// Vault-internal accounts needed to build MeteoraDAmmV2 swap instructions.
+/// Populated during `refresh_vault_balances` Step 1 (vault account fetch).
+#[derive(Debug, Clone)]
+pub struct DammV2SwapAccounts {
+    /// SPL token account inside a_vault; at vault.data[19..51]
+    pub a_token_vault: Pubkey,
+    /// SPL token account inside b_vault; at vault.data[19..51]
+    pub b_token_vault: Pubkey,
+    /// LP mint for a_vault; at vault.data[115..147]
+    pub a_vault_lp_mint: Pubkey,
+    /// LP mint for b_vault; at vault.data[115..147]
+    pub b_vault_lp_mint: Pubkey,
+}
+
 /// Manages pool state refresh via RPC
 pub struct PoolRefreshManager {
     rpc: Arc<RpcClient>,
     reserves: HashMap<Pubkey, PoolReserves>,
     pool_states: HashMap<Pubkey, DeserializedPoolState>,
     serum_markets: HashMap<Pubkey, SerumMarketState>,
+    /// Vault-internal accounts required to build MeteoraDAmmV2 swap instructions.
+    damm_v2_swap_accounts: HashMap<Pubkey, DammV2SwapAccounts>,
     refresh_count: u64,
+    /// Pools already warned as Unknown — suppress repeated log spam (warn once per pool).
+    warned_unknown_pools: std::collections::HashSet<Pubkey>,
 }
 
 impl PoolRefreshManager {
@@ -203,7 +229,9 @@ impl PoolRefreshManager {
             reserves: HashMap::new(),
             pool_states: HashMap::new(),
             serum_markets: HashMap::new(),
+            damm_v2_swap_accounts: HashMap::new(),
             refresh_count: 0,
+            warned_unknown_pools: std::collections::HashSet::new(),
         }
     }
 
@@ -220,6 +248,11 @@ impl PoolRefreshManager {
     /// Get parsed Serum market state
     pub fn get_serum_market(&self, market_address: &Pubkey) -> Option<&SerumMarketState> {
         self.serum_markets.get(market_address)
+    }
+
+    /// Get vault-internal swap accounts for a MeteoraDAmmV2 pool
+    pub fn get_damm_v2_swap_accounts(&self, pool_address: &Pubkey) -> Option<&DammV2SwapAccounts> {
+        self.damm_v2_swap_accounts.get(pool_address)
     }
 
     /// Full refresh: deserialize pool accounts, fetch serum markets, then fetch vault balances
@@ -252,11 +285,24 @@ impl PoolRefreshManager {
                         let global_idx = chunk_start + i;
                         let (pool_addr, ref dex_name) = pool_addresses[global_idx];
 
-                        if let Some(account) = maybe_account {
-                            if account.data.len() > 8 {
-                                let state = self.deserialize_pool_account(dex_name, &account.data);
-                                self.pool_states.insert(pool_addr, state);
-                                refreshed += 1;
+                        match maybe_account {
+                            None => {
+                                // Account does not exist on-chain (bad address in .env or not yet on-chain)
+                                debug!("[PoolState] {} pool {} → account NOT FOUND on-chain",
+                                    dex_name, pool_addr);
+                            }
+                            Some(account) => {
+                                if account.data.len() <= 8 {
+                                    warn!("[PoolState] {} pool {} → data too short: {} bytes (expected >8)",
+                                        dex_name, pool_addr, account.data.len());
+                                } else {
+                                    let state = self.deserialize_pool_account_logged(dex_name, &account.data, &pool_addr);
+                                    let is_unknown = matches!(state, DeserializedPoolState::Unknown);
+                                    self.pool_states.insert(pool_addr, state);
+                                    if !is_unknown {
+                                        refreshed += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -311,6 +357,28 @@ impl PoolRefreshManager {
                 }
             }
         }
+    }
+
+    /// Deserialize a single pool account, logging detailed errors when it fails.
+    /// Unknown-state warnings are emitted only once per pool to avoid log spam across refreshes.
+    fn deserialize_pool_account_logged(&mut self, dex_name: &str, data: &[u8], pool_addr: &Pubkey) -> DeserializedPoolState {
+        let state = self.deserialize_pool_account(dex_name, data);
+        if matches!(state, DeserializedPoolState::Unknown) {
+            // Warn only on the first encounter; subsequent refreshes are silent.
+            if self.warned_unknown_pools.insert(*pool_addr) {
+                warn!("[PoolState] {} pool {} → deserialization returned Unknown (data_len={}). \
+                       This means the on-chain account layout did not match the expected struct. \
+                       Vault reads will use placeholder addresses and reserves will be 0.",
+                    dex_name, pool_addr, data.len());
+                // Log first 32 bytes as hex to help diagnose layout mismatches
+                let preview_len = data.len().min(32);
+                let hex: String = data[..preview_len].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                debug!("[PoolState] {} {} first {} bytes: {}", dex_name, pool_addr, preview_len, hex);
+            }
+        } else {
+            debug!("[PoolState] {} pool {} → deserialized OK (data_len={})", dex_name, pool_addr, data.len());
+        }
+        state
     }
 
     /// Deserialize a single pool account based on DEX type
@@ -387,6 +455,7 @@ impl PoolRefreshManager {
                         active_id: info.active_id,
                         bin_step: info.bin_step,
                         base_factor: info.parameters.base_factor,
+                        bitmap_extension: None, // populated lazily if pool needs extension
                     },
                     Err(_) => DeserializedPoolState::Unknown,
                 }
@@ -396,8 +465,12 @@ impl PoolRefreshManager {
                     Ok(info) => DeserializedPoolState::MeteoraDAmmV2 {
                         a_vault: info.a_vault,
                         b_vault: info.b_vault,
+                        a_vault_lp: info.a_vault_lp,
+                        b_vault_lp: info.b_vault_lp,
                         token_a_mint: info.token_a_mint,
                         token_b_mint: info.token_b_mint,
+                        admin_token_a_fee: info.admin_token_a_fee,
+                        admin_token_b_fee: info.admin_token_b_fee,
                         enabled: info.enabled,
                     },
                     Err(_) => DeserializedPoolState::Unknown,
@@ -552,11 +625,30 @@ impl PoolRefreshManager {
                     // Heaven uses virtual reserves from deserialized state, fallback to pool struct vaults
                     (*pool.token_vault(), *pool.sol_vault())
                 }
-                _ => {
-                    // Fallback to pool struct vault addresses
-                    warn!("[VaultRefresh] {} using FALLBACK vaults (deserialization may have failed)",
-                        pool.get_dex_name());
+                Some(DeserializedPoolState::Pump { .. }) => {
+                    // Pump reserves are overridden at the end of this function from deserialized state.
+                    // Vault SPL token accounts are not fetched for Pump — reserves come from
+                    // the virtual_sol_reserves / virtual_token_reserves fields directly.
+                    // Use pool struct vaults as placeholder; the override block below will set real values.
                     (*pool.token_vault(), *pool.sol_vault())
+                }
+                Some(DeserializedPoolState::MeteoraDAmmV2 { .. }) => {
+                    unreachable!("MeteoraDAmmV2 is skipped by the early continue above");
+                }
+                Some(DeserializedPoolState::Unknown) => {
+                    // Deserialization was attempted but failed (layout mismatch).
+                    // See [PoolState] WARN above for the exact error.
+                    // Fallback vault addresses are placeholder (Pubkey::new_unique) and will return
+                    // no balance, so reserves stay 0 and this pool is filtered by the opportunity detector.
+                    debug!("[VaultRefresh] {} pool={} skipping vault fetch — deserialization Unknown",
+                        pool.get_dex_name(), pool_addr);
+                    continue; // skip rather than fetching placeholder addresses
+                }
+                None => {
+                    // pool_states has no entry yet (first loop, or RPC fetch failed).
+                    debug!("[VaultRefresh] {} pool={} skipping vault fetch — no state cached yet",
+                        pool.get_dex_name(), pool_addr);
+                    continue; // skip rather than fetching placeholder addresses
                 }
             };
 
@@ -657,6 +749,204 @@ impl PoolRefreshManager {
                     });
                     entry.token_reserve = *real_token_reserves;
                     entry.sol_reserve = *real_sol_reserves;
+                }
+            }
+        }
+
+        // ── MeteoraDAmmV2: compute pool reserves via LP-token ratio ──────────────
+        // Meteora Vault accounts are SHARED across multiple pools; `totalAmount` at [11..19]
+        // reflects the whole vault, not just our pool. The pool's real reserve is:
+        //   pool_reserve = vault_totalAmount * (pool_vault_lp_balance / vault_lp_supply)
+        //
+        // Vault layout (Meteora Vault Program 24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi):
+        //   [8]      enabled (u8)
+        //   [9]      vaultBump (u8)
+        //   [10]     tokenVaultBump (u8)
+        //   [11..19] totalAmount (u64 LE)
+        //   [115..147] lpMint (Pubkey)
+        //
+        // SPL Mint account: supply at [36..44] (u64 LE).
+        // SPL Token account: amount at [64..72] (u64 LE).
+        {
+            let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112").unwrap();
+
+            struct DammV2Meta {
+                pool_addr: Pubkey,
+                a_vault:    Pubkey,
+                b_vault:    Pubkey,
+                a_vault_lp: Pubkey, // pool's LP-token SPL account inside a_vault
+                b_vault_lp: Pubkey, // pool's LP-token SPL account inside b_vault
+                a_is_sol:   bool,
+            }
+
+            let mut meta: Vec<DammV2Meta> = Vec::new();
+            for pool in &pool_data.pools {
+                let pool_addr = *pool.pool_address();
+                if let Some(DeserializedPoolState::MeteoraDAmmV2 {
+                    a_vault, b_vault, a_vault_lp, b_vault_lp, token_a_mint, token_b_mint, enabled, ..
+                }) = self.pool_states.get(&pool_addr)
+                {
+                    if !enabled { continue; }
+                    if *token_a_mint != sol_mint && *token_b_mint != sol_mint { continue; }
+                    let a_is_sol = *token_a_mint == sol_mint;
+                    meta.push(DammV2Meta {
+                        pool_addr,
+                        a_vault: *a_vault,
+                        b_vault: *b_vault,
+                        a_vault_lp: *a_vault_lp,
+                        b_vault_lp: *b_vault_lp,
+                        a_is_sol,
+                    });
+                }
+            }
+
+            if !meta.is_empty() {
+                // ── Step 1: fetch vault accounts → totalAmount + lpMint ──────────
+                let vault_keys: Vec<Pubkey> = meta.iter()
+                    .flat_map(|m| [m.a_vault, m.b_vault])
+                    .collect();
+
+                // vault_key → (totalAmount, lp_mint, token_vault)
+                // token_vault at [19..51], totalAmount at [11..19], lpMint at [115..147]
+                let mut vault_info: HashMap<Pubkey, (u64, Pubkey, Pubkey)> = HashMap::new();
+                for chunk in vault_keys.chunks(100) {
+                    match self.rpc.get_multiple_accounts(chunk) {
+                        Ok(accounts) => {
+                            for (i, maybe_acct) in accounts.iter().enumerate() {
+                                if let Some(acct) = maybe_acct {
+                                    if acct.data.len() >= 147 {
+                                        let total = u64::from_le_bytes(
+                                            acct.data[11..19].try_into().unwrap_or([0u8; 8])
+                                        );
+                                        let mut tv_bytes = [0u8; 32];
+                                        tv_bytes.copy_from_slice(&acct.data[19..51]);
+                                        let token_vault = Pubkey::new_from_array(tv_bytes);
+                                        let mut lp_bytes = [0u8; 32];
+                                        lp_bytes.copy_from_slice(&acct.data[115..147]);
+                                        let lp_mint = Pubkey::new_from_array(lp_bytes);
+                                        vault_info.insert(chunk[i], (total, lp_mint, token_vault));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => warn!("[MeteoraDAmmV2] Vault fetch failed: {}", e),
+                    }
+                }
+
+                // ── Step 2: fetch LP mint accounts → total supply ─────────────
+                let lp_mints: Vec<Pubkey> = vault_info.values()
+                    .map(|(_, lp, _)| *lp)
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter().collect();
+
+                // lp_mint → supply
+                let mut lp_supply: HashMap<Pubkey, u64> = HashMap::new();
+                for chunk in lp_mints.chunks(100) {
+                    match self.rpc.get_multiple_accounts(chunk) {
+                        Ok(accounts) => {
+                            for (i, maybe_acct) in accounts.iter().enumerate() {
+                                if let Some(acct) = maybe_acct {
+                                    if acct.data.len() >= 44 {
+                                        let supply = u64::from_le_bytes(
+                                            acct.data[36..44].try_into().unwrap_or([0u8; 8])
+                                        );
+                                        lp_supply.insert(chunk[i], supply);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => warn!("[MeteoraDAmmV2] LP mint fetch failed: {}", e),
+                    }
+                }
+
+                // ── Step 3: fetch vault_lp SPL accounts → pool's LP balance ──
+                let lp_acct_keys: Vec<Pubkey> = meta.iter()
+                    .flat_map(|m| [m.a_vault_lp, m.b_vault_lp])
+                    .collect();
+
+                // vault_lp_acct → pool's LP balance
+                let mut lp_balances: HashMap<Pubkey, u64> = HashMap::new();
+                for chunk in lp_acct_keys.chunks(100) {
+                    match self.rpc.get_multiple_accounts(chunk) {
+                        Ok(accounts) => {
+                            for (i, maybe_acct) in accounts.iter().enumerate() {
+                                if let Some(acct) = maybe_acct {
+                                    if acct.data.len() >= 72 {
+                                        let bal = u64::from_le_bytes(
+                                            acct.data[64..72].try_into().unwrap_or([0u8; 8])
+                                        );
+                                        lp_balances.insert(chunk[i], bal);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => warn!("[MeteoraDAmmV2] LP token account fetch failed: {}", e),
+                    }
+                }
+
+                // ── Step 4: compute pool reserves via ratio, cache swap accounts ──
+                for m in &meta {
+                    let compute_reserve = |vault: Pubkey, lp_acct: Pubkey| -> Option<u64> {
+                        let (total, lp_mint, _) = vault_info.get(&vault)?;
+                        let supply = *lp_supply.get(lp_mint)?;
+                        let balance = *lp_balances.get(&lp_acct)?;
+                        if supply == 0 { return None; }
+                        // Use u128 to avoid overflow (totalAmount can be ~10^13)
+                        let reserve = (*total as u128) * (balance as u128) / (supply as u128);
+                        Some(reserve as u64)
+                    };
+
+                    let a_reserve = match compute_reserve(m.a_vault, m.a_vault_lp) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let b_reserve = match compute_reserve(m.b_vault, m.b_vault_lp) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    if a_reserve == 0 || b_reserve == 0 { continue; }
+
+                    // Sanity guard: reject if either side exceeds 1M SOL equivalent
+                    let max_sane = 1_000_000u64 * 1_000_000_000u64;
+                    if a_reserve > max_sane || b_reserve > max_sane { continue; }
+
+                    let (token_reserve, sol_reserve) = if m.a_is_sol {
+                        (b_reserve, a_reserve)
+                    } else {
+                        (a_reserve, b_reserve)
+                    };
+
+                    let entry = self.reserves.entry(m.pool_addr).or_insert(PoolReserves {
+                        token_reserve: 0,
+                        sol_reserve: 0,
+                        last_updated_slot: 0,
+                    });
+                    entry.token_reserve = token_reserve;
+                    entry.sol_reserve = sol_reserve;
+
+                    // Cache vault-internal accounts needed for swap instruction building
+                    if let (Some((_, a_lp_mint, a_tv)), Some((_, b_lp_mint, b_tv))) = (
+                        vault_info.get(&m.a_vault),
+                        vault_info.get(&m.b_vault),
+                    ) {
+                        self.damm_v2_swap_accounts.insert(m.pool_addr, DammV2SwapAccounts {
+                            a_token_vault: *a_tv,
+                            b_token_vault: *b_tv,
+                            a_vault_lp_mint: *a_lp_mint,
+                            b_vault_lp_mint: *b_lp_mint,
+                        });
+                    }
+
+                    if should_log_diag {
+                        info!("[MeteoraDAmmV2] pool={} token={:.4} sol={:.4} (LP share={:.3}%)",
+                            m.pool_addr,
+                            token_reserve as f64 / 1e9,
+                            sol_reserve as f64 / 1e9,
+                            lp_balances.get(&m.a_vault_lp).copied().unwrap_or(0) as f64
+                                / lp_supply.get(&vault_info.get(&m.a_vault).map(|(_, lp, _)| *lp).unwrap_or_default()).copied().unwrap_or(1) as f64
+                                * 100.0);
+                    }
                 }
             }
         }
