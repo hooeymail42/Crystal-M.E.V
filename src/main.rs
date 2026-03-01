@@ -31,6 +31,9 @@ use crate::chain::capital_manager::CapitalManager;
 use crate::chain::pool_discovery::{PoolDiscovery, PoolDiscoveryConfig};
 use crate::chain::yellowstone_stream::{YellowstoneConfig, start_yellowstone_stream, add_pool_subscriptions};
 use crate::chain::backrun::{BackrunConfig, BackrunDetector, BackrunBundleBuilder};
+use crate::chain::sandwich::{SandwichMonitor, SandwichCalculator, SandwichExecutor};
+use crate::chain::sandwich::monitor::SandwichConfig;
+use crate::chain::sandwich::calculator::SandwichCalculatorConfig;
 use crate::dex::lst::{LstConfig, LstArbitrageScanner};
 
 #[tokio::main]
@@ -737,6 +740,23 @@ async fn main() -> Result<()> {
         info!("[Backrun] Backrun detection disabled (set BACKRUN_ENABLED=true to enable)");
     }
 
+    // ── Sandwich framework ──────────────────────────────────────────────────
+    let sandwich_config = SandwichConfig::from_env();
+    let mut sandwich_monitor = SandwichMonitor::new(sandwich_config.clone());
+    let sandwich_calculator = SandwichCalculator::new(SandwichCalculatorConfig::default());
+    let sandwich_executor = SandwichExecutor::new(
+        sandwich_config.enabled && config.enable_real_execution,
+        backrun_config.jito_tip_lamports,
+    );
+    if sandwich_config.enabled {
+        info!(
+            "[Sandwich] Sandwich detection enabled (min_victim={:.1} SOL)",
+            sandwich_config.min_victim_swap_sol
+        );
+    } else {
+        info!("[Sandwich] Sandwich detection disabled (set SANDWICH_ENABLED=true to enable)");
+    }
+
     let spam_enabled = config.spam_enabled;
     let has_spam_rpcs = !config.spam_rpc_urls.is_empty();
 
@@ -855,6 +875,19 @@ async fn main() -> Result<()> {
                 // ── Phase 5: Backrun detection on every account update ────────
                 if let Some(opp) = backrun_detector.process_update(&update, &refresh_manager) {
                     backrun_bundle_builder.handle_opportunity(&opp);
+                }
+
+                // ── Phase 5b: Sandwich detection ─────────────────────────────
+                if let Some(opp) = sandwich_monitor.process_update(&update, &refresh_manager) {
+                    if let Some(plan) = sandwich_calculator.compute(
+                        &opp,
+                        refresh_manager.get_reserves(&opp.pool_address)
+                            .map(|r| r.sol_reserve).unwrap_or(0),
+                        refresh_manager.get_reserves(&opp.pool_address)
+                            .map(|r| r.token_reserve).unwrap_or(0),
+                    ) {
+                        sandwich_executor.execute(&opp, &plan);
+                    }
                 }
 
                 ys_updates += 1;
