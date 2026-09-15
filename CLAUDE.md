@@ -165,3 +165,35 @@ The active ALT is `3Xj2vwD535dWUFUQCzWup3SuNhCyCYsbSiXhmpLUbSGw` (44 addresses, 
 raw limit. Add new pool/vault accounts with:
 `solana address-lookup-table extend <ALT_ADDR> --addresses "addr1,addr2,..."`
 Keypair at `/tmp/bot-keypair.json` (derived from `SOLANA_KEYPAIR_BASE58` in .env).
+
+### MarginFi Flash-Loan Liquidator (`src/liquidator/`, added 2026-09-15)
+Flash-loan-funded MarginFi v2 liquidator. Scans group accounts → scores health →
+economic gate → assembles an atomic Kamino-flash-loan tx via
+`TransactionBuilder::build_flashloan_transaction` (reused; inner ixs = liquidate +
+collateral swap). **Demo-safe: never sends** (send path forced to demo in `main.rs`).
+
+Verified constants (parse-checked in unit tests):
+- MarginFi v2 program: `MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`
+- Mainnet main group: `4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8`
+  (⚠️ note trailing `8` — the 43-char form is only 31 bytes and will panic)
+- `lending_account_liquidate` Anchor discriminator: `[214,169,151,213,251,167,86,219]`
+  (= `sha256("global:lending_account_liquidate")[..8]`)
+- `WrappedI80F48` = i128 LE / 2^48.
+
+⚠️ **UNVERIFIED — confirm against a live mainnet account before real execution:**
+- `MarginfiAccount`/`Bank` byte offsets in `marginfi/account.rs` (`layout` module).
+  Field ORDER follows the IDL but padding shifts across program upgrades. The
+  `BANK_ASSET_WEIGHT_MAINT`/`BANK_LIABILITY_WEIGHT_MAINT`/`BANK_ORACLE_KEY_0`
+  offsets are the least stable (inside nested `BankConfig`).
+- `lending_account_liquidate` remaining-accounts (health-check bank/oracle pairs)
+  in `marginfi/liquidate_ix.rs` — confirm via a passing `simulateTransaction`.
+- Pyth price-account offsets in `oracle.rs`.
+- Liquidator flow needs MarginFi deposit/withdraw legs around the liquidate ix
+  (borrowed tokens in → seized collateral out) plus collateral→liability swap
+  routing; `assemble_transaction` takes these inner ixs but they are not yet wired.
+
+Config: `MARGINFI_LIQUIDATOR_ENABLED`, `MARGINFI_GROUP`, `MARGINFI_LIQUIDATOR_ACCOUNT`,
+`MARGINFI_MIN_PROFIT_USD`, `MARGINFI_MAX_POSITION_SOL`, `MARGINFI_SCAN_INTERVAL_MS`,
+`MARGINFI_HEALTH_BUFFER`, `MARGINFI_LIQUIDATION_BONUS`, `MARGINFI_MAX_ORACLE_CONF_PCT`,
+`MARGINFI_MAX_ORACLE_AGE_SECS`, `MARGINFI_SWAP_SLIPPAGE_PCT`, `MARGINFI_SWAP_FEE_PCT`,
+`MARGINFI_FIXED_COST_USD`. Reuses `FLASHLOAN_*`/`JITO_*` for the tx path.

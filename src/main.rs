@@ -2,6 +2,7 @@ mod ai;
 mod chain;
 mod config;
 mod dex;
+mod liquidator;
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -160,6 +161,29 @@ async fn main() -> Result<()> {
 
     if config.dynamic_fee_enabled {
         info!("Dynamic priority fees enabled: percentile=p{}", config.fee_percentile);
+    }
+
+    // MarginFi flash-loan liquidator (demo-safe background scan; never sends).
+    match liquidator::config_from_bot(&config) {
+        Ok(Some(liq_cfg)) => {
+            info!(
+                "MarginFi liquidator enabled: group={}, min_profit=${:.2}, real_execution={}",
+                liq_cfg.group, liq_cfg.min_profit_usd, config.enable_real_execution
+            );
+            let liq_tx_builder = Arc::new(TransactionBuilder::new(
+                rpc.clone(),
+                Arc::clone(&payer_arc),
+                config.compute_unit_limit,
+                config.priority_fee_lamports,
+                config.spam_rpc_urls.clone(),
+                false, // liquidator send path is not yet wired; force demo
+            ));
+            let scan_interval = config.marginfi_scan_interval_ms;
+            let engine = liquidator::LiquidatorEngine::new(liq_cfg, rpc.clone(), liq_tx_builder);
+            liquidator::spawn_scan_loop(engine, scan_interval);
+        }
+        Ok(None) => {}
+        Err(e) => warn!("MarginFi liquidator config invalid, disabled: {}", e),
     }
 
     // Initialize capital manager for auto-compounding and dynamic position sizing
