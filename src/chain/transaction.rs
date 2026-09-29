@@ -281,6 +281,29 @@ impl TransactionBuilder {
         get_associated_token_address(&self.payer.pubkey(), mint)
     }
 
+    /// Resolve a `PathStep::action` on a pool with sides A and B into a direction:
+    /// returns `true` when the swap goes A→B.
+    ///
+    /// `"buy"` means SOL→token and `"sell"` means token→SOL, so the answer depends
+    /// on which side holds SOL. Pools order their mints independently of SOL (e.g.
+    /// Whirlpool sorts by byte value), so this must be checked per pool rather
+    /// than assumed. Errors if neither side is SOL, since "buy"/"sell" is then
+    /// undefined.
+    fn sol_side_a_to_b(action: &str, mint_a: &Pubkey, mint_b: &Pubkey) -> Result<bool> {
+        let sol = Pubkey::from_str(crate::chain::constants::SOL_MINT)?;
+        let a_is_sol = *mint_a == sol;
+        if !a_is_sol && *mint_b != sol {
+            return Err(anyhow!("pool has no SOL side ({} / {}); cannot resolve \"{}\"", mint_a, mint_b, action));
+        }
+        let is_buy = match action {
+            "buy" => true,
+            "sell" => false,
+            other => return Err(anyhow!("unknown swap action \"{}\"", other)),
+        };
+        // Buy spends SOL: A→B iff A is SOL. Sell spends the token: A→B iff A is the token.
+        Ok(is_buy == a_is_sol)
+    }
+
     /// Derive Raydium AMM authority PDA
     fn raydium_amm_authority() -> Pubkey {
         // Well-known Raydium AMM V4 authority (derived with nonce=254)
@@ -1025,7 +1048,8 @@ impl TransactionBuilder {
                 }
             };
 
-        let a_to_b = step.action == "sell"; // selling token A for token B
+        // Whirlpools sort mints by byte value, so SOL can be either side.
+        let a_to_b = Self::sol_side_a_to_b(&step.action, &mint_a, &mint_b)?;
 
         // Derive user ATAs
         let user_token_a = self.get_user_ata(&mint_a);
@@ -1107,10 +1131,18 @@ impl TransactionBuilder {
                 }
             };
 
-        let a_to_b = step.action == "sell";
+        // "a_to_b" here means token_0 → token_1 (zero_for_one).
+        let a_to_b = Self::sol_side_a_to_b(&step.action, &mint_0, &mint_1)?;
 
+        // swap_v2 takes input/output accounts, not token_0/token_1: the program
+        // infers direction from which vault is the input.
         let user_token_0 = self.get_user_ata(&mint_0);
         let user_token_1 = self.get_user_ata(&mint_1);
+        let (user_input, user_output, input_vault, output_vault) = if a_to_b {
+            (user_token_0, user_token_1, vault_0, vault_1)
+        } else {
+            (user_token_1, user_token_0, vault_1, vault_0)
+        };
 
         // Derive tick array PDAs
         let ticks_per_array: i32 = tick_spacing as i32 * 60; // Raydium CLMM uses 60 ticks per array
@@ -1131,9 +1163,10 @@ impl TransactionBuilder {
             &program_id,
         );
 
-        // Raydium CLMM swap discriminator
+        // Raydium CLMM swap_v2 discriminator = sha256("global:swap_v2")[..8].
+        // (Previously [.., 106, 116], which matches no instruction.)
         let mut data = Vec::new();
-        data.extend_from_slice(&[43, 4, 237, 11, 26, 201, 106, 116]); // swap_v2 discriminator
+        data.extend_from_slice(&[43, 4, 237, 11, 26, 201, 30, 98]);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
         // sqrt_price_limit_x64 (u128)
@@ -1146,16 +1179,20 @@ impl TransactionBuilder {
         // is_base_input (bool)
         data.push(1u8);
 
+        // NOTE: swap_v2 also expects memo_program, input_vault_mint and
+        // output_vault_mint after token_program_2022, which this list omits.
+        // Unverified against a mainnet simulation; RaydiumClmm stays out of the
+        // liquidator's ROUTABLE_DEXES until it is.
         Ok(Instruction {
             program_id,
             accounts: vec![
                 AccountMeta::new_readonly(self.payer.pubkey(), true),
                 AccountMeta::new_readonly(amm_config, false),
                 AccountMeta::new(*pool_address, false),
-                AccountMeta::new(user_token_0, false),
-                AccountMeta::new(user_token_1, false),
-                AccountMeta::new(vault_0, false),
-                AccountMeta::new(vault_1, false),
+                AccountMeta::new(user_input, false),
+                AccountMeta::new(user_output, false),
+                AccountMeta::new(input_vault, false),
+                AccountMeta::new(output_vault, false),
                 AccountMeta::new(observation_state, false),
                 AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(spl_token_2022::id(), false),
@@ -1190,13 +1227,18 @@ impl TransactionBuilder {
             }
         };
 
-        let (user_source, user_dest) = if step.action == "buy" {
-            (self.get_user_ata(&quote_mint), self.get_user_ata(&base_mint))
-        } else {
+        // Side A = base, side B = quote. SOL is the base on the main SOL market,
+        // so it can't be assumed to be the quote.
+        let base_to_quote = Self::sol_side_a_to_b(&step.action, &base_mint, &quote_mint)?;
+        let (user_source, user_dest) = if base_to_quote {
             (self.get_user_ata(&base_mint), self.get_user_ata(&quote_mint))
+        } else {
+            (self.get_user_ata(&quote_mint), self.get_user_ata(&base_mint))
         };
 
-        // Phoenix swap discriminator
+        // NOTE: Phoenix is a native (non-Anchor) program; this Anchor-style
+        // discriminator and account list don't match its Swap instruction. Kept
+        // as-is pending a proper implementation; excluded from ROUTABLE_DEXES.
         let mut data = Vec::new();
         data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]);
         data.extend_from_slice(&amount_in.to_le_bytes());
@@ -1238,13 +1280,17 @@ impl TransactionBuilder {
             }
         };
 
-        let (user_source, user_dest) = if step.action == "buy" {
-            (self.get_user_ata(&token_b_mint), self.get_user_ata(&token_a_mint))
+        let a_to_b = Self::sol_side_a_to_b(&step.action, &token_a_mint, &token_b_mint)?;
+        let (user_source, user_dest, swap_source, swap_destination) = if a_to_b {
+            (self.get_user_ata(&token_a_mint), self.get_user_ata(&token_b_mint), token_a_vault, token_b_vault)
         } else {
-            (self.get_user_ata(&token_a_mint), self.get_user_ata(&token_b_mint))
+            (self.get_user_ata(&token_b_mint), self.get_user_ata(&token_a_mint), token_b_vault, token_a_vault)
         };
 
-        // Lifinity swap discriminator
+        // NOTE: Lifinity v2's swap also needs the authority, pool_mint, fee
+        // account and oracle accounts (the pool state deserializer reads
+        // pool_mint and three oracles); this 7-account list omits them.
+        // Excluded from ROUTABLE_DEXES until completed.
         let mut data = Vec::new();
         data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]);
         data.extend_from_slice(&amount_in.to_le_bytes());
@@ -1257,8 +1303,8 @@ impl TransactionBuilder {
                 AccountMeta::new_readonly(self.payer.pubkey(), true),
                 AccountMeta::new(user_source, false),
                 AccountMeta::new(user_dest, false),
-                AccountMeta::new(token_a_vault, false),
-                AccountMeta::new(token_b_vault, false),
+                AccountMeta::new(swap_source, false),
+                AccountMeta::new(swap_destination, false),
                 AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data,
@@ -1682,6 +1728,201 @@ mod tests {
         let min_out = u64::from_le_bytes(data[9..17].try_into().unwrap());
         assert_eq!(amount_in, 1000);
         assert_eq!(min_out, 900);
+    }
+
+    // ── Swap direction: builders must find the SOL side, not assume it ──────────
+
+    const MIN_SQRT: u128 = 4295048016;
+    const MAX_SQRT: u128 = 79226673515401279992447579055;
+
+    fn sol() -> Pubkey {
+        Pubkey::from_str(crate::chain::constants::SOL_MINT).unwrap()
+    }
+
+    fn direction_setup() -> (TransactionBuilder, PoolRefreshManager, Pubkey) {
+        // No RPC calls are made; builders read only the seeded pool state.
+        let rpc = Arc::new(RpcClient::new("http://127.0.0.1:1".to_string()));
+        let payer = Arc::new(Keypair::new());
+        let payer_pk = payer.pubkey();
+        let tb = TransactionBuilder::new(rpc.clone(), payer, 400_000, 10_000, vec![], false);
+        (tb, PoolRefreshManager::new(rpc), payer_pk)
+    }
+
+    fn step(action: &str) -> PathStep {
+        PathStep {
+            dex: String::new(),
+            pool_address: String::new(),
+            action: action.to_string(),
+            price: 0.0,
+            token_in: String::new(),
+            token_out: String::new(),
+            amount_in: 0.0,
+            amount_out: 0.0,
+            slippage_bps: 0,
+        }
+    }
+
+    fn u128_at(data: &[u8], off: usize) -> u128 {
+        u128::from_le_bytes(data[off..off + 16].try_into().unwrap())
+    }
+
+    /// Every (SOL on side A / SOL on side B) × (buy / sell) combination, with the
+    /// expected A→B direction: buy spends SOL, sell spends the token.
+    fn direction_cases() -> Vec<(Pubkey, Pubkey, &'static str, bool)> {
+        let token = Pubkey::new_unique();
+        vec![
+            (sol(), token, "buy", true),
+            (sol(), token, "sell", false),
+            (token, sol(), "buy", false),
+            (token, sol(), "sell", true),
+        ]
+    }
+
+    #[test]
+    fn sol_side_helper_covers_both_orderings() {
+        for (a, b, action, expected) in direction_cases() {
+            assert_eq!(
+                TransactionBuilder::sol_side_a_to_b(action, &a, &b).unwrap(),
+                expected,
+                "{} with SOL on side {}",
+                action,
+                if a == sol() { "A" } else { "B" }
+            );
+        }
+    }
+
+    #[test]
+    fn sol_side_helper_rejects_non_sol_pool_and_bad_action() {
+        let (x, y) = (Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(TransactionBuilder::sol_side_a_to_b("buy", &x, &y).is_err());
+        assert!(TransactionBuilder::sol_side_a_to_b("swap", &sol(), &y).is_err());
+    }
+
+    #[test]
+    fn whirlpool_direction_follows_sol_side() {
+        for (mint_a, mint_b, action, a_to_b) in direction_cases() {
+            let (tb, mut rm, _) = direction_setup();
+            let pool = Pubkey::new_unique();
+            rm.insert_pool_state_for_test(pool, DeserializedPoolState::WhirlpoolState {
+                vault_a: Pubkey::new_unique(),
+                vault_b: Pubkey::new_unique(),
+                mint_a,
+                mint_b,
+                sqrt_price: 0,
+                liquidity: 0,
+                fee_rate: 0,
+                tick_current_index: 0,
+                tick_spacing: 64,
+            });
+            let ix = tb.build_whirlpool_swap_from_step(&pool, &rm, 1, 0, &step(action)).unwrap();
+            // data: disc(8) amount(8) threshold(8) sqrt_limit(16) specified_is_input(1) a_to_b(1)
+            assert_eq!(ix.data[41] == 1, a_to_b, "{} a_to_b flag", action);
+            assert_eq!(u128_at(&ix.data, 24), if a_to_b { MIN_SQRT } else { MAX_SQRT });
+            let input_mint = if a_to_b { mint_a } else { mint_b };
+            assert_eq!(input_mint == sol(), action == "buy", "{} must spend SOL iff buy", action);
+        }
+    }
+
+    #[test]
+    fn whirlpool_rejects_pool_without_sol() {
+        let (tb, mut rm, _) = direction_setup();
+        let pool = Pubkey::new_unique();
+        rm.insert_pool_state_for_test(pool, DeserializedPoolState::WhirlpoolState {
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            mint_a: Pubkey::new_unique(),
+            mint_b: Pubkey::new_unique(),
+            sqrt_price: 0,
+            liquidity: 0,
+            fee_rate: 0,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        });
+        assert!(tb.build_whirlpool_swap_from_step(&pool, &rm, 1, 0, &step("buy")).is_err());
+    }
+
+    #[test]
+    fn raydium_clmm_orders_accounts_by_input_output() {
+        for (mint_0, mint_1, action, zero_for_one) in direction_cases() {
+            let (tb, mut rm, payer) = direction_setup();
+            let pool = Pubkey::new_unique();
+            let (vault_0, vault_1) = (Pubkey::new_unique(), Pubkey::new_unique());
+            rm.insert_pool_state_for_test(pool, DeserializedPoolState::RaydiumClmm {
+                vault_0,
+                vault_1,
+                mint_0,
+                mint_1,
+                sqrt_price_x64: 0,
+                liquidity: 0,
+                tick_current: 0,
+                tick_spacing: 60,
+                fee_rate: 0,
+                amm_config: Pubkey::new_unique(),
+                observation_state: Pubkey::new_unique(),
+            });
+            let ix = tb.build_raydium_clmm_swap_from_step(&pool, &rm, 1, 0, &step(action)).unwrap();
+            assert_eq!(&ix.data[..8], &[43, 4, 237, 11, 26, 201, 30, 98], "swap_v2 discriminator");
+            let (in_mint, out_mint, in_vault, out_vault) = if zero_for_one {
+                (mint_0, mint_1, vault_0, vault_1)
+            } else {
+                (mint_1, mint_0, vault_1, vault_0)
+            };
+            assert_eq!(ix.accounts[3].pubkey, get_associated_token_address(&payer, &in_mint));
+            assert_eq!(ix.accounts[4].pubkey, get_associated_token_address(&payer, &out_mint));
+            assert_eq!(ix.accounts[5].pubkey, in_vault);
+            assert_eq!(ix.accounts[6].pubkey, out_vault);
+            assert_eq!(u128_at(&ix.data, 24), if zero_for_one { MIN_SQRT } else { MAX_SQRT });
+            assert_eq!(in_mint == sol(), action == "buy", "{} must spend SOL iff buy", action);
+        }
+    }
+
+    #[test]
+    fn phoenix_direction_follows_sol_side() {
+        // (base, quote): SOL as base is the main SOL market's layout.
+        for (base_mint, quote_mint, action, base_to_quote) in direction_cases() {
+            let (tb, mut rm, payer) = direction_setup();
+            let pool = Pubkey::new_unique();
+            rm.insert_pool_state_for_test(pool, DeserializedPoolState::Phoenix {
+                base_vault: Pubkey::new_unique(),
+                quote_vault: Pubkey::new_unique(),
+                base_mint,
+                quote_mint,
+                taker_fee_bps: 0,
+                best_bid_price: 0,
+                best_ask_price: 0,
+            });
+            let ix = tb.build_phoenix_swap_from_step(&pool, &rm, 1, 0, &step(action)).unwrap();
+            let (src, dst) = if base_to_quote { (base_mint, quote_mint) } else { (quote_mint, base_mint) };
+            assert_eq!(ix.accounts[2].pubkey, get_associated_token_address(&payer, &src));
+            assert_eq!(ix.accounts[3].pubkey, get_associated_token_address(&payer, &dst));
+            assert_eq!(src == sol(), action == "buy", "{} must spend SOL iff buy", action);
+        }
+    }
+
+    #[test]
+    fn lifinity_direction_follows_sol_side() {
+        for (token_a_mint, token_b_mint, action, a_to_b) in direction_cases() {
+            let (tb, mut rm, payer) = direction_setup();
+            let pool = Pubkey::new_unique();
+            let (vault_a, vault_b) = (Pubkey::new_unique(), Pubkey::new_unique());
+            rm.insert_pool_state_for_test(pool, DeserializedPoolState::Lifinity {
+                token_a_vault: vault_a,
+                token_b_vault: vault_b,
+                token_a_mint,
+                token_b_mint,
+            });
+            let ix = tb.build_lifinity_swap_from_step(&pool, &rm, 1, 0, &step(action)).unwrap();
+            let (src, dst, src_vault, dst_vault) = if a_to_b {
+                (token_a_mint, token_b_mint, vault_a, vault_b)
+            } else {
+                (token_b_mint, token_a_mint, vault_b, vault_a)
+            };
+            assert_eq!(ix.accounts[2].pubkey, get_associated_token_address(&payer, &src));
+            assert_eq!(ix.accounts[3].pubkey, get_associated_token_address(&payer, &dst));
+            assert_eq!(ix.accounts[4].pubkey, src_vault);
+            assert_eq!(ix.accounts[5].pubkey, dst_vault);
+            assert_eq!(src == sol(), action == "buy", "{} must spend SOL iff buy", action);
+        }
     }
 
     #[test]

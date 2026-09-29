@@ -39,17 +39,16 @@ use crate::chain::pools::{MintPoolData, PoolData};
 use crate::chain::refresh::PoolRefreshManager;
 use crate::chain::transaction::TransactionBuilder;
 
-/// DEXes whose `build_*_swap_from_step` derives direction by checking which pool
-/// side is SOL, so a `"buy"`/`"sell"` step is always encoded correctly.
+/// DEXes whose `build_*_swap_from_step` resolves direction from the pool's SOL
+/// side *and* emits an otherwise complete instruction.
 ///
-/// Deliberately excluded even though the builder handles them:
-/// - `Whirlpool`, `RaydiumClmm`: `a_to_b = action == "sell"` assumes the token is
-///   `mint_a`/`mint_0`; pools with SOL on that side get the direction flipped.
-/// - `Phoenix`: assumes SOL is the quote mint.
-/// - `Lifinity`: assumes SOL is `token_b`.
-///
-/// Add them back once their builders check the SOL side.
-pub const ROUTABLE_DEXES: &[&str] = &["Raydium", "DLMM", "MeteoraDAmmV2", "Pump", "Heaven"];
+/// Excluded even though their builders now resolve direction correctly, because
+/// the instruction is still incomplete (see the NOTEs in `chain/transaction.rs`):
+/// - `RaydiumClmm`: swap_v2 account list lacks memo_program and the vault mints.
+/// - `Phoenix`: native program, but built with an Anchor discriminator/layout.
+/// - `Lifinity`: v2 swap needs authority, pool_mint, fee and oracle accounts.
+pub const ROUTABLE_DEXES: &[&str] =
+    &["Raydium", "DLMM", "MeteoraDAmmV2", "Whirlpool", "Pump", "Heaven"];
 
 /// A pool the router may use, reduced to what routing needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -295,13 +294,13 @@ mod tests {
         let token = Pubkey::new_unique();
         let router = SwapRouter::new(vec![
             cand("RaydiumCp", token, sol()),   // no builder
-            cand("Whirlpool", token, sol()),   // direction assumes token is mint_a
-            cand("RaydiumClmm", token, sol()), // same
-            cand("Phoenix", token, sol()),     // assumes SOL is quote
-            cand("Lifinity", token, sol()),    // assumes SOL is token_b
+            cand("RaydiumClmm", token, sol()), // swap_v2 account list incomplete
+            cand("Phoenix", token, sol()),     // non-Anchor program, Anchor encoding
+            cand("Lifinity", token, sol()),    // missing oracle/fee/authority accounts
             cand("Raydium", token, sol()),
+            cand("Whirlpool", token, sol()),   // direction now resolved from SOL side
         ]);
-        assert_eq!(router.candidate_count(), 1);
+        assert_eq!(router.candidate_count(), 2);
     }
 
     #[test]
