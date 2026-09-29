@@ -18,6 +18,7 @@
 
 pub mod marginfi;
 pub mod oracle;
+pub mod router;
 pub mod scanner;
 
 use std::sync::Arc;
@@ -85,6 +86,112 @@ pub struct LiquidationCandidate {
     pub repay_usd: f64,
     /// Estimated net profit in USD after all costs.
     pub net_profit_usd: f64,
+    /// Mint of the seized collateral (swap input).
+    pub asset_mint: Pubkey,
+    pub asset_decimals: u8,
+    pub asset_price_usd: f64,
+    /// Mint of the repaid debt (swap output, and the flash-borrowed asset).
+    pub liab_mint: Pubkey,
+    pub liab_decimals: u8,
+    pub liab_price_usd: f64,
+    /// Latest SOL/USD seen by the scanner, needed to size two-hop routes.
+    pub sol_price_usd: Option<f64>,
+}
+
+/// Leg amounts for a candidate's collateral swap, plus the flash-borrow size
+/// they must cover.
+#[derive(Debug, Clone)]
+pub struct CollateralSwapPlan {
+    pub legs: Vec<router::LegAmounts>,
+    /// Flash-borrow amount in the liability's native units (= debt repaid).
+    pub borrow_native: u64,
+    /// Guaranteed minimum output of the final swap leg, after slippage.
+    pub final_min_out: u64,
+}
+
+fn usd_to_native(usd: f64, price_usd: f64, decimals: u8) -> u64 {
+    (usd / price_usd * 10f64.powi(decimals as i32)).floor() as u64
+}
+
+/// Mirror of the builder's `min_amount_out = amount_out * (10000 - bps) / 10000`.
+fn min_out(expected_out: u64, slippage_bps: u16) -> u64 {
+    ((expected_out as f64) * (10000.0 - slippage_bps as f64) / 10000.0) as u64
+}
+
+/// Size each leg of `route` for `cand` in native units, and check that the final
+/// leg's slippage-bounded minimum output repays the flash loan plus its fee.
+///
+/// That check is what makes the swap safe to put inside the flash-loan
+/// transaction: each leg enforces its `min_amount_out` on-chain, so if the swap
+/// succeeds the repay is covered, and if it can't deliver, the whole
+/// transaction reverts.
+pub fn plan_collateral_swap(
+    cand: &LiquidationCandidate,
+    route: &[router::RouteLeg],
+    cfg: &LiquidatorConfig,
+) -> Result<CollateralSwapPlan> {
+    if cand.asset_price_usd <= 0.0 || cand.liab_price_usd <= 0.0 {
+        bail!("non-positive oracle price");
+    }
+    let slippage_bps = (cfg.swap_slippage_pct * 10_000.0).round().clamp(0.0, 10_000.0) as u16;
+    let keep = 1.0 - cfg.swap_fee_pct;
+    let seized_usd = cand.repay_usd * (1.0 + cfg.liquidation_bonus);
+    let seize_native = usd_to_native(seized_usd, cand.asset_price_usd, cand.asset_decimals);
+    let borrow_native = usd_to_native(cand.repay_usd, cand.liab_price_usd, cand.liab_decimals);
+
+    let legs = match route.len() {
+        // Collateral is already the liability asset.
+        0 => vec![],
+        1 => vec![router::LegAmounts {
+            amount_in: seize_native,
+            expected_out: usd_to_native(seized_usd * keep, cand.liab_price_usd, cand.liab_decimals),
+            slippage_bps,
+        }],
+        2 => {
+            let sol_price = match cand.sol_price_usd {
+                Some(p) if p > 0.0 => p,
+                _ => bail!("two-hop route needs a SOL price; none seen yet"),
+            };
+            let sol_out = usd_to_native(seized_usd * keep, sol_price, 9);
+            // Leg 2 is exact-in, so only spend what leg 1 is guaranteed to deliver.
+            let sol_in = min_out(sol_out, slippage_bps);
+            let leg2_usd = sol_in as f64 / 1e9 * sol_price;
+            vec![
+                router::LegAmounts {
+                    amount_in: seize_native,
+                    expected_out: sol_out,
+                    slippage_bps,
+                },
+                router::LegAmounts {
+                    amount_in: sol_in,
+                    expected_out: usd_to_native(leg2_usd * keep, cand.liab_price_usd, cand.liab_decimals),
+                    slippage_bps,
+                },
+            ]
+        }
+        n => bail!("unsupported route length {}", n),
+    };
+
+    // With no swap, the seized collateral itself repays the loan.
+    let final_min_out = match legs.last() {
+        Some(l) => min_out(l.expected_out, l.slippage_bps),
+        None => usd_to_native(seized_usd, cand.liab_price_usd, cand.liab_decimals),
+    };
+    let repay_required = (borrow_native as f64 * (1.0 + cfg.flashloan_fee_pct)).ceil() as u64;
+    if final_min_out < repay_required {
+        bail!(
+            "swap min output {} does not cover flash repay {} (borrow {} + fee)",
+            final_min_out,
+            repay_required,
+            borrow_native
+        );
+    }
+
+    Ok(CollateralSwapPlan {
+        legs,
+        borrow_native,
+        final_min_out,
+    })
 }
 
 /// Build a [`LiquidatorConfig`] from the global `BotConfig`. Returns `Ok(None)`
@@ -124,13 +231,18 @@ pub fn config_from_bot(cfg: &crate::config::BotConfig) -> Result<Option<Liquidat
     }))
 }
 
-/// Spawn a demo-safe background scan loop for the liquidator. It scans and logs
-/// profitable candidates on `scan_interval_ms`; it never sends a transaction
-/// (the collateral-swap routing and layout verification are the remaining gates
-/// before real execution). Returns immediately with the spawned task handle.
+/// Spawn the background scan loop. The MarginFi scan is slow (a
+/// `getProgramAccounts` pass plus per-bank/oracle fetches), so it runs off the
+/// main loop and hands profitable candidates to it over `tx`. The main loop owns
+/// `PoolRefreshManager`, so it plans and builds the collateral swap there; no
+/// pool state is shared across threads. Nothing is ever sent from here.
+///
+/// Candidates are dropped when the channel is full; a still-liquidatable account
+/// is re-emitted on the next scan.
 pub fn spawn_scan_loop(
     mut engine: LiquidatorEngine,
     scan_interval_ms: u64,
+    tx: crossbeam_channel::Sender<LiquidationCandidate>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         info!(
@@ -140,7 +252,18 @@ pub fn spawn_scan_loop(
         loop {
             let now = chrono::Utc::now().timestamp();
             match engine.run_once(now) {
-                Ok(_c) => {}
+                Ok(candidates) => {
+                    for c in candidates {
+                        match tx.try_send(c) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(_)) => break,
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                warn!("liquidator candidate receiver dropped; stopping scan loop");
+                                return;
+                            }
+                        }
+                    }
+                }
                 Err(e) => warn!("liquidator scan error: {}", e),
             }
             std::thread::sleep(std::time::Duration::from_millis(scan_interval_ms));
@@ -174,8 +297,9 @@ pub struct LiquidatorEngine {
     cfg: LiquidatorConfig,
     scanner: MarginfiScanner,
     tx_builder: Arc<TransactionBuilder>,
-    /// SOL price in USD, used to convert the SOL-denominated position cap and to
-    /// value SOL-denominated flash borrows. Refreshed by the caller.
+    /// SOL price in USD, used for the SOL-denominated position cap and to size
+    /// two-hop swap routes. Updated whenever the scan prices a SOL-mint bank;
+    /// 0.0 until then.
     sol_price_usd: f64,
 }
 
@@ -205,9 +329,10 @@ impl LiquidatorEngine {
         &mut self,
         account: &MarginfiAccount,
         now_unix: i64,
-    ) -> Option<(Vec<WeightedPosition>, Vec<(Pubkey, Bank)>)> {
+    ) -> Option<(Vec<WeightedPosition>, Vec<(Pubkey, Bank, f64)>)> {
         let mut positions = Vec::new();
         let mut banks = Vec::new();
+        let native_sol = spl_token::native_mint::id();
         for bal in account.active_balances() {
             let bank = match self.scanner.load_bank(&bal.bank_pk) {
                 Ok(b) => b,
@@ -227,6 +352,9 @@ impl LiquidatorEngine {
             {
                 debug!("skip account: unusable price for bank {}", bal.bank_pk);
                 return None;
+            }
+            if bank.mint == native_sol {
+                self.sol_price_usd = price.price_usd;
             }
 
             let asset_amt = bank.asset_amount(&bal.asset_shares);
@@ -249,7 +377,7 @@ impl LiquidatorEngine {
                     is_liability: true,
                 });
             }
-            banks.push((bal.bank_pk, bank));
+            banks.push((bal.bank_pk, bank, price.price_usd));
         }
         Some((positions, banks))
     }
@@ -271,36 +399,37 @@ impl LiquidatorEngine {
 
         // Pick the largest liability as the debt to repay and the largest asset
         // as the collateral to seize.
+        // Tuples are (bank pubkey, bank, price_usd, native amount).
         let liab = banks
             .iter()
-            .filter_map(|(bpk, b)| {
+            .filter_map(|(bpk, b, px)| {
                 let owed = account
                     .active_balances()
                     .find(|x| &x.bank_pk == bpk)
                     .map(|x| b.liability_amount(&x.liability_shares))
                     .unwrap_or(0.0);
                 if owed > 0.0 {
-                    Some((*bpk, b.clone(), owed))
+                    Some((*bpk, b.clone(), *px, owed))
                 } else {
                     None
                 }
             })
-            .max_by(|a, c| a.2.partial_cmp(&c.2).unwrap())?;
+            .max_by(|a, c| a.3.partial_cmp(&c.3).unwrap())?;
         let asset = banks
             .iter()
-            .filter_map(|(bpk, b)| {
+            .filter_map(|(bpk, b, px)| {
                 let held = account
                     .active_balances()
                     .find(|x| &x.bank_pk == bpk)
                     .map(|x| b.asset_amount(&x.asset_shares))
                     .unwrap_or(0.0);
                 if held > 0.0 {
-                    Some((*bpk, b.clone(), held))
+                    Some((*bpk, b.clone(), *px, held))
                 } else {
                     None
                 }
             })
-            .max_by(|a, c| a.2.partial_cmp(&c.2).unwrap())?;
+            .max_by(|a, c| a.3.partial_cmp(&c.3).unwrap())?;
 
         let repay_usd = health::max_repay_usd(
             &report,
@@ -342,6 +471,13 @@ impl LiquidatorEngine {
             asset_bank: asset.0,
             repay_usd,
             net_profit_usd: net,
+            asset_mint: asset.1.mint,
+            asset_decimals: asset.1.mint_decimals,
+            asset_price_usd: asset.2,
+            liab_mint: liab.1.mint,
+            liab_decimals: liab.1.mint_decimals,
+            liab_price_usd: liab.2,
+            sol_price_usd: (self.sol_price_usd > 0.0).then_some(self.sol_price_usd),
         })
     }
 
@@ -436,6 +572,120 @@ mod tests {
         let small = estimate_net_profit_usd(100.0, 0.05, 0.0009, 0.005, 0.003, 0.5);
         let big = estimate_net_profit_usd(10_000.0, 0.05, 0.0009, 0.005, 0.003, 0.5);
         assert!(big > small);
+    }
+
+    fn plan_cfg() -> LiquidatorConfig {
+        LiquidatorConfig {
+            enabled: true,
+            program: marginfi::constants::marginfi_program_id(),
+            group: marginfi::constants::marginfi_main_group(),
+            liquidator_marginfi_account: None,
+            min_profit_usd: 5.0,
+            max_position_sol: 50.0,
+            health_buffer: 0.0,
+            liquidation_bonus: 0.05,
+            max_oracle_conf_pct: 0.02,
+            max_oracle_age_secs: 60,
+            flashloan_fee_pct: 0.0009,
+            swap_slippage_pct: 0.005,
+            swap_fee_pct: 0.003,
+            fixed_cost_usd: 0.5,
+        }
+    }
+
+    /// $1000 of USDC-like debt (6 dp, $1) against a 9-dp collateral at $100.
+    fn plan_cand(sol_price: Option<f64>) -> LiquidationCandidate {
+        LiquidationCandidate {
+            liquidatee: Pubkey::new_unique(),
+            health_factor: 0.9,
+            liab_bank: Pubkey::new_unique(),
+            asset_bank: Pubkey::new_unique(),
+            repay_usd: 1000.0,
+            net_profit_usd: 30.0,
+            asset_mint: Pubkey::new_unique(),
+            asset_decimals: 9,
+            asset_price_usd: 100.0,
+            liab_mint: Pubkey::new_unique(),
+            liab_decimals: 6,
+            liab_price_usd: 1.0,
+            sol_price_usd: sol_price,
+        }
+    }
+
+    fn leg(from: Pubkey, to: Pubkey, token: Pubkey) -> router::RouteLeg {
+        router::RouteLeg {
+            pool: router::PoolCandidate {
+                dex: "Raydium".into(),
+                pool_address: Pubkey::new_unique(),
+                token_mint: token,
+                base_mint: spl_token::native_mint::id(),
+            },
+            from_mint: from,
+            to_mint: to,
+        }
+    }
+
+    #[test]
+    fn plan_direct_leg_sizes_and_covers_repay() {
+        let cand = plan_cand(None);
+        let route = vec![leg(cand.asset_mint, cand.liab_mint, cand.asset_mint)];
+        let plan = plan_collateral_swap(&cand, &route, &plan_cfg()).unwrap();
+        assert_eq!(plan.legs.len(), 1);
+        // Seize $1050 of a $100, 9-dp token = 10.5 tokens.
+        assert_eq!(plan.legs[0].amount_in, 10_500_000_000);
+        // Borrow = $1000 of a $1, 6-dp token.
+        assert_eq!(plan.borrow_native, 1_000_000_000);
+        assert_eq!(plan.legs[0].slippage_bps, 50);
+        assert!(plan.final_min_out >= (1_000_000_000f64 * 1.0009).ceil() as u64);
+    }
+
+    #[test]
+    fn plan_two_hop_requires_sol_price() {
+        let cand = plan_cand(None);
+        let sol = spl_token::native_mint::id();
+        let route = vec![
+            leg(cand.asset_mint, sol, cand.asset_mint),
+            leg(sol, cand.liab_mint, cand.liab_mint),
+        ];
+        assert!(plan_collateral_swap(&cand, &route, &plan_cfg()).is_err());
+    }
+
+    #[test]
+    fn plan_two_hop_second_leg_spends_only_guaranteed_sol() {
+        let cand = plan_cand(Some(150.0));
+        let sol = spl_token::native_mint::id();
+        let route = vec![
+            leg(cand.asset_mint, sol, cand.asset_mint),
+            leg(sol, cand.liab_mint, cand.liab_mint),
+        ];
+        let plan = plan_collateral_swap(&cand, &route, &plan_cfg()).unwrap();
+        assert_eq!(plan.legs.len(), 2);
+        let l1 = plan.legs[0];
+        let l2 = plan.legs[1];
+        assert_eq!(l2.amount_in, min_out(l1.expected_out, l1.slippage_bps));
+        assert!(plan.final_min_out >= (plan.borrow_native as f64 * 1.0009).ceil() as u64);
+    }
+
+    #[test]
+    fn plan_rejects_when_swap_cannot_cover_repay() {
+        // A 0.1% bonus can't absorb 0.3% fee + 0.5% slippage.
+        let mut cfg = plan_cfg();
+        cfg.liquidation_bonus = 0.001;
+        let cand = plan_cand(None);
+        let route = vec![leg(cand.asset_mint, cand.liab_mint, cand.asset_mint)];
+        let err = plan_collateral_swap(&cand, &route, &cfg).unwrap_err();
+        assert!(err.to_string().contains("does not cover flash repay"));
+    }
+
+    #[test]
+    fn plan_no_swap_when_collateral_is_liability() {
+        let mut cand = plan_cand(None);
+        cand.asset_mint = cand.liab_mint;
+        cand.asset_decimals = cand.liab_decimals;
+        cand.asset_price_usd = cand.liab_price_usd;
+        let plan = plan_collateral_swap(&cand, &[], &plan_cfg()).unwrap();
+        assert!(plan.legs.is_empty());
+        assert!(plan.final_min_out > plan.borrow_native);
     }
 
     #[test]

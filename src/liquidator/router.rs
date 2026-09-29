@@ -17,6 +17,8 @@
 //! # Routes
 //!
 //! - **Direct**: one pool whose two mints are exactly {collateral, liability}.
+//!   Every routable pool is SOL-based, so this only happens when the collateral
+//!   or the liability is SOL.
 //! - **Two-hop via SOL**: collateral → SOL on a collateral/SOL pool, then
 //!   SOL → liability on a liability/SOL pool. The intermediate SOL flows through
 //!   the shared WSOL ATA.
@@ -37,20 +39,17 @@ use crate::chain::pools::{MintPoolData, PoolData};
 use crate::chain::refresh::PoolRefreshManager;
 use crate::chain::transaction::TransactionBuilder;
 
-/// DEX names that `TransactionBuilder::build_instructions_from_opportunity` can
-/// actually build. Pools on any other DEX are ignored by the router, since the
-/// builder would silently skip them (`Unsupported DEX for IX building`).
-pub const SUPPORTED_DEXES: &[&str] = &[
-    "Raydium",
-    "Pump",
-    "DLMM",
-    "MeteoraDAmmV2",
-    "Whirlpool",
-    "RaydiumClmm",
-    "Phoenix",
-    "Lifinity",
-    "Heaven",
-];
+/// DEXes whose `build_*_swap_from_step` derives direction by checking which pool
+/// side is SOL, so a `"buy"`/`"sell"` step is always encoded correctly.
+///
+/// Deliberately excluded even though the builder handles them:
+/// - `Whirlpool`, `RaydiumClmm`: `a_to_b = action == "sell"` assumes the token is
+///   `mint_a`/`mint_0`; pools with SOL on that side get the direction flipped.
+/// - `Phoenix`: assumes SOL is the quote mint.
+/// - `Lifinity`: assumes SOL is `token_b`.
+///
+/// Add them back once their builders check the SOL side.
+pub const ROUTABLE_DEXES: &[&str] = &["Raydium", "DLMM", "MeteoraDAmmV2", "Pump", "Heaven"];
 
 /// A pool the router may use, reduced to what routing needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,16 +106,20 @@ pub struct SwapRouter {
 }
 
 impl SwapRouter {
+    /// Keep only pools the builders can encode correctly: a routable DEX with
+    /// SOL as the base mint (the builders' `"buy"`/`"sell"` convention assumes a
+    /// SOL side).
     pub fn new(candidates: Vec<PoolCandidate>) -> Self {
+        let sol = Pubkey::from_str(SOL_MINT).expect("valid SOL mint");
         let candidates = candidates
             .into_iter()
-            .filter(|c| SUPPORTED_DEXES.contains(&c.dex.as_str()))
+            .filter(|c| ROUTABLE_DEXES.contains(&c.dex.as_str()) && c.base_mint == sol)
             .collect();
         Self { candidates }
     }
 
-    /// Build a router from the bot's loaded pools. Unsupported DEXes are
-    /// dropped.
+    /// Build a router from the bot's loaded pools. Non-routable pools are
+    /// dropped (see [`ROUTABLE_DEXES`]).
     pub fn from_mint_pool_datas(mpds: &[MintPoolData]) -> Self {
         let candidates = mpds
             .iter()
@@ -288,14 +291,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_dexes_are_filtered() {
+    fn non_routable_dexes_are_filtered() {
         let token = Pubkey::new_unique();
         let router = SwapRouter::new(vec![
-            cand("RaydiumCp", token, sol()),
-            cand("Solfi", token, sol()),
-            cand("Whirlpool", token, sol()),
+            cand("RaydiumCp", token, sol()),   // no builder
+            cand("Whirlpool", token, sol()),   // direction assumes token is mint_a
+            cand("RaydiumClmm", token, sol()), // same
+            cand("Phoenix", token, sol()),     // assumes SOL is quote
+            cand("Lifinity", token, sol()),    // assumes SOL is token_b
+            cand("Raydium", token, sol()),
         ]);
         assert_eq!(router.candidate_count(), 1);
+    }
+
+    #[test]
+    fn non_sol_base_pools_are_filtered() {
+        let token = Pubkey::new_unique();
+        let usdc = Pubkey::new_unique();
+        let router = SwapRouter::new(vec![cand("Raydium", token, usdc)]);
+        assert_eq!(router.candidate_count(), 0);
     }
 
     #[test]
@@ -314,7 +328,7 @@ mod tests {
         let liability = Pubkey::new_unique();
         let router = SwapRouter::new(vec![
             cand("Raydium", collateral, sol()),
-            cand("Whirlpool", liability, sol()),
+            cand("DLMM", liability, sol()),
         ]);
         let route = router.find_route(&collateral, &liability).unwrap();
         assert_eq!(route.len(), 2);

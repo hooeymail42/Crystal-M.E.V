@@ -189,8 +189,24 @@ Verified constants (parse-checked in unit tests):
   in `marginfi/liquidate_ix.rs` — confirm via a passing `simulateTransaction`.
 - Pyth price-account offsets in `oracle.rs`.
 - Liquidator flow needs MarginFi deposit/withdraw legs around the liquidate ix
-  (borrowed tokens in → seized collateral out) plus collateral→liability swap
-  routing; `assemble_transaction` takes these inner ixs but they are not yet wired.
+  (borrowed tokens in → seized collateral out); not yet wired. Nor are the
+  liquidate-ix accounts, so the full tx is never assembled.
+- User ATAs for collateral/liability mints are not created (arb path uses
+  `ensure_intermediate_atas`); needed before a real send.
+
+Collateral-swap routing (`liquidator/router.rs`, wired 2026-09-29):
+- Threading: the MarginFi scan runs on a `spawn_blocking` thread and sends
+  `LiquidationCandidate`s over a bounded crossbeam channel. The **main loop**
+  (which owns `PoolRefreshManager`) drains it right after the pool refresh, then
+  routes, plans, and builds the swap ixs. No pool state is shared across threads.
+- `SwapRouter` only uses SOL-based pools on `ROUTABLE_DEXES` (Raydium, DLMM,
+  MeteoraDAmmV2, Pump, Heaven). Whirlpool/RaydiumClmm/Phoenix/Lifinity are excluded
+  because their builders assume which side is SOL (see comment in router.rs).
+- Routes: direct if collateral or liability is SOL, else two hops via SOL. Swap
+  ixs come from `build_instructions_from_opportunity` (partial routes rejected).
+- `plan_collateral_swap` sizes legs from oracle prices and **rejects any plan whose
+  final-leg min_out < borrow × (1 + flash fee)**. Two-hop needs SOL/USD, taken from
+  the MarginFi SOL bank's oracle when the scan prices it.
 
 Config: `MARGINFI_LIQUIDATOR_ENABLED`, `MARGINFI_GROUP`, `MARGINFI_LIQUIDATOR_ACCOUNT`,
 `MARGINFI_MIN_PROFIT_USD`, `MARGINFI_MAX_POSITION_SOL`, `MARGINFI_SCAN_INTERVAL_MS`,
