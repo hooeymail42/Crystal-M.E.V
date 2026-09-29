@@ -245,6 +245,13 @@ impl PoolRefreshManager {
         self.pool_states.get(pool_address)
     }
 
+    /// Seed pool state directly, so instruction builders can be unit-tested
+    /// without RPC.
+    #[cfg(test)]
+    pub(crate) fn insert_pool_state_for_test(&mut self, pool_address: Pubkey, state: DeserializedPoolState) {
+        self.pool_states.insert(pool_address, state);
+    }
+
     /// Get parsed Serum market state
     pub fn get_serum_market(&self, market_address: &Pubkey) -> Option<&SerumMarketState> {
         self.serum_markets.get(market_address)

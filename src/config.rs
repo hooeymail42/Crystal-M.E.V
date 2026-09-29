@@ -31,6 +31,20 @@ pub struct BotConfig {
     pub alt_addresses: Vec<String>,
     pub mints: Vec<MintConfig>,
     pub per_leg_slippage_bps: u16,
+    // --- MarginFi liquidator ---
+    pub marginfi_liquidator_enabled: bool,
+    pub marginfi_group: String,
+    pub marginfi_liquidator_account: String,
+    pub marginfi_min_profit_usd: f64,
+    pub marginfi_max_position_sol: f64,
+    pub marginfi_scan_interval_ms: u64,
+    pub marginfi_health_buffer: f64,
+    pub marginfi_liquidation_bonus: f64,
+    pub marginfi_max_oracle_conf_pct: f64,
+    pub marginfi_max_oracle_age_secs: i64,
+    pub marginfi_swap_slippage_pct: f64,
+    pub marginfi_swap_fee_pct: f64,
+    pub marginfi_fixed_cost_usd: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +183,34 @@ impl BotConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30u16);
 
+        // --- MarginFi liquidator ---
+        let env_f64 = |k: &str, d: f64| -> f64 {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let marginfi_liquidator_enabled = std::env::var("MARGINFI_LIQUIDATOR_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false);
+        let marginfi_group = std::env::var("MARGINFI_GROUP").unwrap_or_default();
+        let marginfi_liquidator_account =
+            std::env::var("MARGINFI_LIQUIDATOR_ACCOUNT").unwrap_or_default();
+        let marginfi_min_profit_usd = env_f64("MARGINFI_MIN_PROFIT_USD", 5.0);
+        let marginfi_max_position_sol = env_f64("MARGINFI_MAX_POSITION_SOL", 50.0);
+        let marginfi_scan_interval_ms = std::env::var("MARGINFI_SCAN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400u64);
+        let marginfi_health_buffer = env_f64("MARGINFI_HEALTH_BUFFER", 0.0);
+        let marginfi_liquidation_bonus = env_f64("MARGINFI_LIQUIDATION_BONUS", 0.05);
+        let marginfi_max_oracle_conf_pct = env_f64("MARGINFI_MAX_ORACLE_CONF_PCT", 0.02);
+        let marginfi_max_oracle_age_secs = std::env::var("MARGINFI_MAX_ORACLE_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60i64);
+        let marginfi_swap_slippage_pct = env_f64("MARGINFI_SWAP_SLIPPAGE_PCT", 0.005);
+        let marginfi_swap_fee_pct = env_f64("MARGINFI_SWAP_FEE_PCT", 0.003);
+        let marginfi_fixed_cost_usd = env_f64("MARGINFI_FIXED_COST_USD", 0.5);
+
         Ok(Self {
             rpc_url,
             ws_url,
@@ -196,6 +238,19 @@ impl BotConfig {
             alt_addresses,
             mints,
             per_leg_slippage_bps,
+            marginfi_liquidator_enabled,
+            marginfi_group,
+            marginfi_liquidator_account,
+            marginfi_min_profit_usd,
+            marginfi_max_position_sol,
+            marginfi_scan_interval_ms,
+            marginfi_health_buffer,
+            marginfi_liquidation_bonus,
+            marginfi_max_oracle_conf_pct,
+            marginfi_max_oracle_age_secs,
+            marginfi_swap_slippage_pct,
+            marginfi_swap_fee_pct,
+            marginfi_fixed_cost_usd,
         })
     }
 

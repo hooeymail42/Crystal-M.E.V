@@ -2,6 +2,7 @@ mod ai;
 mod chain;
 mod config;
 mod dex;
+mod liquidator;
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -160,6 +161,37 @@ async fn main() -> Result<()> {
 
     if config.dynamic_fee_enabled {
         info!("Dynamic priority fees enabled: percentile=p{}", config.fee_percentile);
+    }
+
+    // MarginFi flash-loan liquidator (demo-safe; never sends). The scan runs in the
+    // background and hands candidates to the main loop, which owns the pool state
+    // needed to build the collateral swap.
+    let mut liq_channel: Option<(
+        crossbeam_channel::Receiver<liquidator::LiquidationCandidate>,
+        liquidator::LiquidatorConfig,
+    )> = None;
+    match liquidator::config_from_bot(&config) {
+        Ok(Some(liq_cfg)) => {
+            info!(
+                "MarginFi liquidator enabled: group={}, min_profit=${:.2}, real_execution={}",
+                liq_cfg.group, liq_cfg.min_profit_usd, config.enable_real_execution
+            );
+            let liq_tx_builder = Arc::new(TransactionBuilder::new(
+                rpc.clone(),
+                Arc::clone(&payer_arc),
+                config.compute_unit_limit,
+                config.priority_fee_lamports,
+                config.spam_rpc_urls.clone(),
+                false, // liquidator send path is not yet wired; force demo
+            ));
+            let scan_interval = config.marginfi_scan_interval_ms;
+            let (cand_tx, cand_rx) = crossbeam_channel::bounded(32);
+            liq_channel = Some((cand_rx, liq_cfg.clone()));
+            let engine = liquidator::LiquidatorEngine::new(liq_cfg, rpc.clone(), liq_tx_builder);
+            liquidator::spawn_scan_loop(engine, scan_interval, cand_tx);
+        }
+        Ok(None) => {}
+        Err(e) => warn!("MarginFi liquidator config invalid, disabled: {}", e),
     }
 
     // Initialize capital manager for auto-compounding and dynamic position sizing
@@ -766,6 +798,15 @@ async fn main() -> Result<()> {
         info!("[DEMO MODE] Set ENABLE_REAL_EXECUTION=true to go live");
     }
 
+    // Collateral-swap router over the pools the main loop keeps refreshed.
+    let liq_router = liquidator::router::SwapRouter::from_mint_pool_datas(&mint_pool_datas);
+    // Last time each liquidatee was logged, so a persistently unhealthy account
+    // doesn't log on every scan.
+    let mut liq_last_logged: HashMap<Pubkey, std::time::Instant> = HashMap::new();
+    if liq_channel.is_some() {
+        info!("[LIQ] Collateral-swap router: {} routable pools", liq_router.candidate_count());
+    }
+
     let mut interval = tokio::time::interval(
         tokio::time::Duration::from_millis(config.loop_interval_ms)
     );
@@ -925,6 +966,49 @@ async fn main() -> Result<()> {
                         warn!("Refresh error for mint {}: {}", mpd.mint, e);
                     }
                 }
+            }
+        }
+
+        // MarginFi liquidation candidates: route + build the collateral swap against
+        // the pool state refreshed above. DEMO: logs the plan, never sends — the
+        // liquidate-ix accounts and MarginFi deposit/withdraw legs are not wired yet.
+        if let Some((ref liq_rx, ref liq_cfg)) = liq_channel {
+            for cand in liq_rx.try_iter().take(4) {
+                if liq_last_logged
+                    .get(&cand.liquidatee)
+                    .map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(30))
+                {
+                    continue;
+                }
+                liq_last_logged.insert(cand.liquidatee, std::time::Instant::now());
+
+                let Some(route) = liq_router.find_route(&cand.asset_mint, &cand.liab_mint) else {
+                    info!("[LIQ] {} hf={:.3} net=${:.2}: no routable pool for {} → {}",
+                        cand.liquidatee, cand.health_factor, cand.net_profit_usd,
+                        cand.asset_mint, cand.liab_mint);
+                    continue;
+                };
+                let plan = match liquidator::plan_collateral_swap(&cand, &route, liq_cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        info!("[LIQ] {} skipped: {}", cand.liquidatee, e);
+                        continue;
+                    }
+                };
+                let dexes: Vec<&str> = route.iter().map(|l| l.pool.dex.as_str()).collect();
+                match liquidator::router::SwapRouter::build_swap_instructions(
+                    &tx_builder, &refresh_manager, &route, &plan.legs,
+                ) {
+                    Ok(ixs) => info!(
+                        "[LIQ][DEMO] {} hf={:.3} repay=${:.2} net=${:.2} | route {:?} → {} swap ixs | borrow={} min_out={}",
+                        cand.liquidatee, cand.health_factor, cand.repay_usd, cand.net_profit_usd,
+                        dexes, ixs.len(), plan.borrow_native, plan.final_min_out,
+                    ),
+                    Err(e) => info!("[LIQ] {} swap build failed on {:?}: {}", cand.liquidatee, dexes, e),
+                }
+            }
+            if loop_count % 200 == 0 {
+                liq_last_logged.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(300));
             }
         }
 

@@ -165,3 +165,74 @@ The active ALT is `3Xj2vwD535dWUFUQCzWup3SuNhCyCYsbSiXhmpLUbSGw` (44 addresses, 
 raw limit. Add new pool/vault accounts with:
 `solana address-lookup-table extend <ALT_ADDR> --addresses "addr1,addr2,..."`
 Keypair at `/tmp/bot-keypair.json` (derived from `SOLANA_KEYPAIR_BASE58` in .env).
+
+### MarginFi Flash-Loan Liquidator (`src/liquidator/`, added 2026-09-15)
+Flash-loan-funded MarginFi v2 liquidator. Scans group accounts → scores health →
+economic gate → assembles an atomic Kamino-flash-loan tx via
+`TransactionBuilder::build_flashloan_transaction` (reused; inner ixs = liquidate +
+collateral swap). **Demo-safe: never sends** (send path forced to demo in `main.rs`).
+
+Verified constants (parse-checked in unit tests):
+- MarginFi v2 program: `MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`
+- Mainnet main group: `4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8`
+  (⚠️ note trailing `8` — the 43-char form is only 31 bytes and will panic)
+- `lending_account_liquidate` Anchor discriminator: `[214,169,151,213,251,167,86,219]`
+  (= `sha256("global:lending_account_liquidate")[..8]`)
+- `WrappedI80F48` = i128 LE / 2^48.
+
+⚠️ **UNVERIFIED — confirm against a live mainnet account before real execution:**
+- `MarginfiAccount`/`Bank` byte offsets in `marginfi/account.rs` (`layout` module).
+  Field ORDER follows the IDL but padding shifts across program upgrades. The
+  `BANK_ASSET_WEIGHT_MAINT`/`BANK_LIABILITY_WEIGHT_MAINT`/`BANK_ORACLE_KEY_0`
+  offsets are the least stable (inside nested `BankConfig`).
+- `lending_account_liquidate` remaining-accounts (health-check bank/oracle pairs)
+  in `marginfi/liquidate_ix.rs` — confirm via a passing `simulateTransaction`.
+- Pyth price-account offsets in `oracle.rs`.
+- Liquidator flow needs MarginFi deposit/withdraw legs around the liquidate ix
+  (borrowed tokens in → seized collateral out); not yet wired. Nor are the
+  liquidate-ix accounts, so the full tx is never assembled.
+- User ATAs for collateral/liability mints are not created (arb path uses
+  `ensure_intermediate_atas`); needed before a real send.
+
+Collateral-swap routing (`liquidator/router.rs`, wired 2026-09-29):
+- Threading: the MarginFi scan runs on a `spawn_blocking` thread and sends
+  `LiquidationCandidate`s over a bounded crossbeam channel. The **main loop**
+  (which owns `PoolRefreshManager`) drains it right after the pool refresh, then
+  routes, plans, and builds the swap ixs. No pool state is shared across threads.
+- `SwapRouter` only uses SOL-based pools on `ROUTABLE_DEXES` (Raydium, DLMM,
+  MeteoraDAmmV2, Whirlpool, Pump, Heaven). RaydiumClmm/Phoenix/Lifinity are excluded
+  because their instructions are incomplete (see "Swap Builder Direction" below).
+  Whirlpool swaps only pass 3 tick arrays, so very large swaps can run out of
+  arrays and revert.
+- Routes: direct if collateral or liability is SOL, else two hops via SOL. Swap
+  ixs come from `build_instructions_from_opportunity` (partial routes rejected).
+- `plan_collateral_swap` sizes legs from oracle prices and **rejects any plan whose
+  final-leg min_out < borrow × (1 + flash fee)**. Two-hop needs SOL/USD, taken from
+  the MarginFi SOL bank's oracle when the scan prices it.
+
+Config: `MARGINFI_LIQUIDATOR_ENABLED`, `MARGINFI_GROUP`, `MARGINFI_LIQUIDATOR_ACCOUNT`,
+`MARGINFI_MIN_PROFIT_USD`, `MARGINFI_MAX_POSITION_SOL`, `MARGINFI_SCAN_INTERVAL_MS`,
+`MARGINFI_HEALTH_BUFFER`, `MARGINFI_LIQUIDATION_BONUS`, `MARGINFI_MAX_ORACLE_CONF_PCT`,
+`MARGINFI_MAX_ORACLE_AGE_SECS`, `MARGINFI_SWAP_SLIPPAGE_PCT`, `MARGINFI_SWAP_FEE_PCT`,
+`MARGINFI_FIXED_COST_USD`. Reuses `FLASHLOAN_*`/`JITO_*` for the tx path.
+
+### Swap Builder Direction (FIXED 2026-09-29)
+`PathStep::action` is `"buy"` = SOL→token, `"sell"` = token→SOL. The Whirlpool,
+Raydium CLMM, Phoenix and Lifinity builders used to assume a fixed side was SOL
+(e.g. `a_to_b = action == "sell"`), which flipped the swap on pools with SOL on
+the other side. Whirlpool orders mints by byte value, and SOL is the base on
+Phoenix's main SOL market. All four now call `TransactionBuilder::sol_side_a_to_b`,
+which checks which side is SOL and errors if neither is. Covered by builder-level
+tests over both mint orderings (`PoolRefreshManager::insert_pool_state_for_test`).
+
+Raydium CLMM `swap_v2` takes **input/output** accounts, not token_0/token_1. The
+builder used to always pass token_0 first, so every swap went 0→1. Its
+discriminator was also wrong (`[..,106,116]`); correct is
+`sha256("global:swap_v2")[..8]` = `[43,4,237,11,26,201,30,98]`.
+
+Still broken beyond direction (UNFIXED; excluded from the liquidator router):
+- RaydiumClmm: `swap_v2` account list omits memo_program + input/output vault mints.
+- Phoenix: native (non-Anchor) program, but built with an Anchor `swap`
+  discriminator and a made-up account list.
+- Lifinity: v2 swap needs authority, pool_mint, fee and oracle accounts; the
+  builder passes 7 accounts. Pool state already deserializes pool_mint + oracles.
